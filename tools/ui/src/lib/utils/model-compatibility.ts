@@ -1,3 +1,5 @@
+/** llama.cpp's default `--fit-target` margin, in MB. */
+
 /**
  * Model hardware-compatibility estimation, ported from ggml-org/llama-macos
  * (`Model+Compatibility.swift`, `HFRepoResolver.swift`, `SidecarPicker.swift`).
