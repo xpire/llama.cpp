@@ -193,3 +193,45 @@ at 550-620 t/s — 2-4× above the 4070 Ti's mmq prefill ceiling (120-250 t/s). 
 payoff for A3B-class models here; the P720 + GLM-5.3 (Skylake, no VNNI, 31-47 t/s CPU) remains the
 valid GPU-prefill target. Decode: attention-on-GPU lifts TG from 16.7 to 51.3 t/s — that offload
 is already in production config.
+
+### 8.1 Crossover demo: dense 14B (Qwen3-14B Q4_K_M, 9.0 GB, NAS-hosted)
+
+Fits entirely in 12 GB VRAM — the resident-GPU case (raw JSON: `research/m1/bench-d/e-*`):
+
+| Test | CPU (`-ngl 0`) | GPU (`-ngl 999`) | GPU/CPU |
+|---|---|---|---|
+| PP 512 | 865 t/s | 3,265 t/s | 3.8× |
+| PP 2048 | 871 t/s | 3,192 t/s | 3.7× |
+| TG 64 | 6.4 t/s | 51.9 t/s | 8× |
+
+Prefill value flips on active-params-per-GB: A3B (streams 22 GB through 12 GB VRAM) loses to
+CPU; dense 14B (resident) wins 3.7×. GLM-5.3 is the anti-case (156 GB vs 8 GB cache) — see §9.
+
+### 8.2 PCIe stream ceiling (measured, `research/m1/pcie-bw`)
+
+| Source | H2D bandwidth |
+|---|---|
+| pageable (mmap'd weights, no host registration) | 19.1 GB/s |
+| pinned (cudaHostAlloc / #26659 registration) | 26.9 GB/s |
+
+Pinned staging (PR #26659) is worth +41% on the copy path — confirms the M4 design choice.
+
+## 9. Streaming regime analysis — GLM-5.3 on 12 GB cards (correction to the roadmap)
+
+The roadmap's 121-243 t/s (1× 4070 Ti) was compute-only arithmetic (160 T MACs) and does NOT
+survive the cache reality: GLM-5.3 IQ4_XS = 156.8 GB, ~140 GB experts, ~8 GB usable expert cache
+on a 12 GB card -> ~2 slots/layer -> ~18 waves/ubatch -> ~610 MB streamed per token at batch 4096
+-> ~44 t/s effective at the measured 26.9 GB/s (31 t/s pageable). GPU prefill on a 12 GB card is
+PCIe/cache-bound at parity with the 31-47 t/s CPU baseline — the headline win needs:
+
+| Config | Expert cache | Est. effective prefill |
+|---|---|---|
+| 1× 4070 Ti 12 GB | ~8 GB | ~44 t/s (≈ CPU parity) |
+| 2× 4070 Ti 24 GB | ~16 GB | ~88 t/s |
+| 2× 5060 Ti 16 GB | ~24 GB | ~131 t/s (≥120 target) |
+| 1× 4070 Ti, batch 8192 | ~8 GB | ~88 t/s (wave amortization) |
+
+Implications: (1) `--moe-stream-cache` budget (VRAM) and batch size are the levers, not raw GPU
+compute; (2) the ≥120 t/s verification target requires ≥24 GB cache (2× cards) or batch 8192+;
+(3) the wave/preload stats in the skeleton are exactly the instrumentation needed to verify this
+once M2 lands; (4) #26659 pinned staging becomes a requirement, not an optimization.
