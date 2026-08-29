@@ -1062,13 +1062,13 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
-    // (ids_scale param re-added by the M2 graph-injection commit: ids to use for the w_s gather
-    //  when the GEMM ids are remapped cache slots)
+    // ids_scale: ids to use for the w_s gather, when the GEMM ids are remapped cache slots (MoE streaming)
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+              ggml_tensor * ids_scale = nullptr) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,
