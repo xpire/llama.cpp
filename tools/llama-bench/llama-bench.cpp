@@ -375,6 +375,10 @@ struct cmd_params {
     bool                             no_warmup;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
+    bool                             moe_stream = false;
+    uint32_t                         moe_stream_slots = 0;
+    uint64_t                         moe_stream_budget = 0;
+    int32_t                          moe_stream_io_threads = 0;
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -730,6 +734,35 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_cpu_moe.insert(params.n_cpu_moe.end(), p.begin(), p.end());
+            } else if (arg == "--moe-stream") {
+                params.moe_stream = true;
+            } else if (arg == "--moe-stream-cache") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.moe_stream = true;
+                size_t pos = 0;
+                const uint64_t n = std::stoull(argv[i], &pos);
+                std::string suffix = std::string(argv[i]).substr(pos);
+                for (auto & c : suffix) {
+                    c = std::tolower(c);
+                }
+                if (suffix == "s" || suffix == "slot" || suffix == "slots") {
+                    params.moe_stream_slots = n;
+                } else if (suffix.empty() || suffix == "g" || suffix == "gb" || suffix == "gib") {
+                    params.moe_stream_budget = n * 1024ull * 1024ull * 1024ull;
+                } else {
+                    invalid_param = true;
+                    break;
+                }
+            } else if (arg == "--moe-stream-io-threads") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.moe_stream = true;
+                params.moe_stream_io_threads = std::stoi(argv[i]);
             } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1246,6 +1279,10 @@ struct cmd_params_instance {
     int                poll;
     int                n_gpu_layers;
     int                n_cpu_moe;
+    bool               moe_stream = false;
+    uint32_t           moe_stream_slots = 0;
+    uint64_t           moe_stream_budget = 0;
+    int32_t            moe_stream_io_threads = 0;
     llama_split_mode   split_mode;
     llama_load_mode    load_mode;
     llama_lazy_mode    lazy_mode;
@@ -1265,6 +1302,10 @@ struct cmd_params_instance {
         llama_model_params mparams = llama_model_default_params();
 
         mparams.n_gpu_layers = n_gpu_layers;
+        mparams.moe_stream            = moe_stream;
+        mparams.moe_stream_slots      = moe_stream_slots;
+        mparams.moe_stream_budget     = moe_stream_budget;
+        mparams.moe_stream_io_threads = moe_stream_io_threads;
         if (!devices.empty()) {
             mparams.devices = const_cast<ggml_backend_dev_t *>(devices.data());
         }
@@ -1316,6 +1357,8 @@ struct cmd_params_instance {
 
     bool equal_mparams(const cmd_params_instance & other) const {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
+               moe_stream == other.moe_stream && moe_stream_slots == other.moe_stream_slots &&
+               moe_stream_budget == other.moe_stream_budget && moe_stream_io_threads == other.moe_stream_io_threads &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
@@ -1391,6 +1434,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll                  = */ pl,
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
+                /* .moe_stream            = */ params.moe_stream,
+                /* .moe_stream_slots      = */ params.moe_stream_slots,
+                /* .moe_stream_budget     = */ params.moe_stream_budget,
+                /* .moe_stream_io_threads = */ params.moe_stream_io_threads,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1428,6 +1475,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll                  = */ pl,
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
+                /* .moe_stream            = */ params.moe_stream,
+                /* .moe_stream_slots      = */ params.moe_stream_slots,
+                /* .moe_stream_budget     = */ params.moe_stream_budget,
+                /* .moe_stream_io_threads = */ params.moe_stream_io_threads,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1465,6 +1516,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll                  = */ pl,
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
+                /* .moe_stream            = */ params.moe_stream,
+                /* .moe_stream_slots      = */ params.moe_stream_slots,
+                /* .moe_stream_budget     = */ params.moe_stream_budget,
+                /* .moe_stream_io_threads = */ params.moe_stream_io_threads,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
