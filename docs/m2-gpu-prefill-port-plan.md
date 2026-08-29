@@ -176,10 +176,20 @@ decode (`n_tokens == 1` or small) is **untouched** (`--n-cpu-moe` as today).
 
 ## 8. M1 baseline (this box: Ryzen 7 7800X3D, 96 GB RAM, RTX 4070 Ti 12 GB)
 
-Filled in after `llama-bench` completes — see below.
+Measured 2026-08-30 with the CUDA 13.3 build on `feat/prefill-gpu-ada` (commit `3ef6aa0dc`).
+Model: Qwen3.6-35B-A3B-UD-Q4_K_XL (22 GB, HF-cached; also Q8_K_XL for the user-config check).
+Raw JSON in `research/m1/`.
 
-| Test | Tokens/s | Notes |
-|---|---|---|
-| CPU prefill (experts CPU, `--n-cpu-moe`) | _pending_ | Qwen3.6-35B-A3B-UD-Q4_K_XL (22 GB, HF-cached) |
-| Decode (experts CPU) | _pending_ | same model |
-| GPU ceiling (all layers GPU, if VRAM allows) | _pending_ | VRAM is ~10.3/12.3 GB occupied by the live Vulkan llama-server; may be VRAM-limited |
+| Test | Pure CPU (`-ngl 0`) | Attn GPU, experts CPU (`-ngl 999 -ncmoe 40`) | Q8, user config (`-ngl 999 -ncmoe 35`, b1024) |
+|---|---|---|---|
+| PP 128 | 179 t/s | 220 t/s | _pending_ |
+| PP 512 | 551 t/s | 619 t/s | — |
+| PP 1024 | — | — | _pending_ |
+| PP 2048 | 555 t/s | 612 t/s | — |
+| TG 32/64/128 | 16.7 t/s | 51.3 t/s | _pending_ |
+
+**Conclusion**: on this box the CPU (AVX-512 VNNI, ~3+ TOPS int8) prefills a 3B-active model
+at 550-620 t/s — 2-4× above the 4070 Ti's mmq prefill ceiling (120-250 t/s). GPU prefill has no
+payoff for A3B-class models here; the P720 + GLM-5.3 (Skylake, no VNNI, 31-47 t/s CPU) remains the
+valid GPU-prefill target. Decode: attention-on-GPU lifts TG from 16.7 to 51.3 t/s — that offload
+is already in production config.
