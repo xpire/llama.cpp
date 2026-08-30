@@ -34,7 +34,7 @@ Attention: stays GPU-resident both phases (fits for A3B; for GLM-5.3-class needs
 | P1 | **RAM→GPU copy pool + host materialization** (this run): experts materialized in RAM; stream cache filled by copies from host tensors, not disk pread; decode phase selects host tensors (no remap) | IN PROGRESS |
 | P2 | Parameterized engagement gate: `--moe-stream-min-ubatch <N>` (streaming only for ubatch ≥ N; encode F3 — the LvLLM 4096 default is wrong for bandwidth-bound A3B) | next |
 | P3 | GLM-5.3-class (P720): needs ≥24 GB GPU; optional attention per-ubatch preload for 12 GB cards; batch 8192 to amortize | P720-gated |
-| P4 | Overlap: prefetch next ubatch's experts during current compute (CUDA event chains, #26659 pinned staging) | after P1-P2 |
+| P4 | Overlap: prefetch next ubatch's experts during current compute (CUDA event chains, #26659 pinned staging) | **M4-1 done** (`cd5fbae5d`: heap-backed host experts +41%, pinning wired/no-gain); cross-layer prefetch + event chains remain (speculative — routing dependency) |
 
 ## 4. Per-model targets
 
