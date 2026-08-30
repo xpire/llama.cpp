@@ -587,6 +587,7 @@ struct common_params {
     uint64_t moe_stream_budget     = 0;     // total expert cache byte budget, used when slots == 0 (0 = auto)
     int32_t  moe_stream_io_threads = 0;     // expert load I/O threads (<= 0 = default)
     bool     moe_stream_direct     = false; // use O_DIRECT for expert reads (bypass page cache)
+    uint32_t moe_stream_window     = 0;     // layer-window streaming pool slots (0 = expert-slot mode)
 
     bool single_turn       = false; // single turn chat conversation
 

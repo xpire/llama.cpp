@@ -124,12 +124,19 @@ struct llama_moe_stream_work {
 };
 
 struct llama_moe_stream {
-    uint32_t n_slots      = 0; // expert cache slots per streamed layer
+    uint32_t n_slots      = 0; // expert cache slots per streamed layer (window mode: == n_expert)
     int32_t  n_io_threads = 0;
+
+    // layer-window mode (LvLLM-style rolling residency): n_window pool slots, each holding one
+    // layer's FULL expert set; layer N's cache tensors are window_pool[N % n_window][k].
+    // 0 = expert-slot mode (the PR #25294 machinery). No slot floor in window mode.
+    uint32_t n_window = 0;
+    std::vector<std::vector<ggml_tensor *>> window_pool; // [slot][weight-index]
+    std::vector<int32_t> window_pool_gen;                // [slot] layer whose data it holds (-1 = none)
 
     std::vector<std::unique_ptr<llama_moe_stream_layer>> layers; // [n_layer], null = not streamed
 
-    llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct);
+    llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, uint32_t n_window = 0);
     ~llama_moe_stream();
 
     llama_moe_stream_layer * layer(int32_t il) const {
@@ -145,7 +152,7 @@ struct llama_moe_stream {
     void alloc_bufs(bool no_alloc);
 
     // link the materialized host tensor to its cache tensor (decode phase uses the host tensor)
-    void set_host(ggml_tensor * cache, ggml_tensor * host);
+    void set_host(int32_t il, ggml_tensor * host);
 
     // page-lock the materialized host tensors so host->device copies use DMA (M4 / #26659);
     // no-op unless a backend registers host buffers (CUDA gates on GGML_CUDA_REGISTER_HOST)
@@ -207,6 +214,15 @@ struct llama_moe_stream {
     void worker_loop();
     int32_t pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep) const;
     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
+
+    // layer-window mode: enqueue the next layer's FULL expert load (no wait); called from the
+    // remap after the current layer is resident. layer order is deterministic, so the copies
+    // overlap the current layer's compute (the LvLLM prefetch-window trick).
+    void prefetch_layer(int32_t il);
+
+    // layer-window mode: if the pool slot currently holds a different layer's bytes (or none),
+    // reset this layer's slot state and claim the slot for this layer. called under mtx.
+    void claim_slot_locked(llama_moe_stream_layer & sl, uint32_t slot);
 
     // multi-pass prefill helpers (called by llama_moe_stream_wave_ids, all under mtx)
     void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n); // wave 0: build the plan

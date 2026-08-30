@@ -138,7 +138,7 @@ bool llama_moe_stream_layer::matches(const ggml_tensor * gate, const ggml_tensor
 }
 
 // sizes the per-layer table and clamps the I/O thread count; workers are spawned lazily on first use
-llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct) : n_slots(n_slots) {
+llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, uint32_t n_window) : n_slots(n_slots), n_window(n_window) {
     layers.resize(n_layer);
 
     this->n_io_threads = n_io_threads <= 0 ? MOE_STREAM_IO_THREADS_DEFAULT : n_io_threads;
@@ -176,7 +176,10 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
     const uint32_t n_expert  = meta->ne[2];
     const size_t   nb_expert = ggml_nbytes(meta) / n_expert;
     GGML_ASSERT(nb_expert * n_expert == ggml_nbytes(meta));
-    GGML_ASSERT(n_slots > 0 && n_slots < n_expert);
+    GGML_ASSERT(n_slots > 0 && n_slots <= n_expert); // window mode: n_slots == n_expert
+
+    // layer-window mode holds a FULL layer per pool slot; expert mode holds n_slots slabs
+    const uint32_t n_slots_eff = n_window > 0 ? n_expert : n_slots;
 
     ggml_context * ctx = nullptr;
     for (auto & [cur_buft, cur_ctx] : ctxs) {
@@ -198,9 +201,36 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
         ctxs.emplace_back(buft, ctx);
     }
 
-    ggml_tensor * cache = ggml_new_tensor_3d(ctx, meta->type, meta->ne[0], meta->ne[1], n_slots);
-    ggml_format_name(cache, "%s.stream_cache", meta->name);
-    GGML_ASSERT(ggml_nbytes(cache) == nb_expert * n_slots);
+    ggml_tensor * cache = nullptr;
+    if (n_window > 0) {
+        // shared pool slot: layer N uses window_pool[N % n_window][k] where k is this layer's
+        // weight index (0,1,2 for gate/up/down or fused gate_up/down); the slot's tensors are
+        // created on the first layer mapped to it and reused (overwritten) by later ones
+        const uint32_t slot = (uint32_t) il % n_window;
+        if (window_pool.size() <= slot) {
+            window_pool.resize(slot + 1);
+            window_pool_gen.resize(slot + 1, -1);
+        }
+        auto & ws = window_pool[slot];
+        // pool tensors are keyed by shape so layers with different expert geometries
+        // (e.g. MTP blocks) share the slot machinery without shape collisions
+        cache = nullptr;
+        for (auto * t : ws) {
+            if (t->type == meta->type && t->ne[0] == meta->ne[0] && t->ne[1] == meta->ne[1]) {
+                cache = t;
+                break;
+            }
+        }
+        if (cache == nullptr) {
+            cache = ggml_new_tensor_3d(ctx, meta->type, meta->ne[0], meta->ne[1], n_expert);
+            ws.push_back(cache);
+        }
+        ggml_format_name(cache, "%s.stream_window", meta->name);
+    } else {
+        cache = ggml_new_tensor_3d(ctx, meta->type, meta->ne[0], meta->ne[1], n_slots);
+        ggml_format_name(cache, "%s.stream_cache", meta->name);
+    }
+    GGML_ASSERT(ggml_nbytes(cache) == nb_expert * n_slots_eff);
 
     auto & sl = layers[il];
     if (!sl) {
@@ -208,12 +238,12 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
         sl->mgr      = this;
         sl->il       = il;
         sl->n_expert = n_expert;
-        sl->n_slots  = n_slots;
-        sl->slot_expert  .resize(n_slots, -1);
-        sl->slot_state   .resize(n_slots, LLAMA_MOE_STREAM_SLOT_EMPTY);
-        sl->slot_claimed .resize(n_slots, 0);
-        sl->slot_gen     .resize(n_slots, 0);
-        sl->slot_last_use.resize(n_slots, 0);
+        sl->n_slots  = n_slots_eff;
+        sl->slot_expert  .resize(n_slots_eff, -1);
+        sl->slot_state   .resize(n_slots_eff, LLAMA_MOE_STREAM_SLOT_EMPTY);
+        sl->slot_claimed .resize(n_slots_eff, 0);
+        sl->slot_gen     .resize(n_slots_eff, 0);
+        sl->slot_last_use.resize(n_slots_eff, 0);
         sl->route_hotness.resize(n_expert, 0);
         sl->seen         .resize(n_expert, 0);
         sl->keep         .resize(n_slots, 0);
@@ -356,6 +386,9 @@ void llama_moe_stream::worker_loop() {
             //   races with the main thread and segfaults (measured).
             const uint8_t * src = (const uint8_t *) wt.host->data + (size_t) w.expert*wt.nb_expert;
             ggml_backend_tensor_set(wt.cache, src, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
+            if (n_window > 0 && debug) {
+                fprintf(stderr, "DBG copy il=%d wt=%s expert=%d slot=%d nb=%zu\n", sl.il, ggml_get_name(wt.cache), w.expert, w.slot, wt.nb_expert);
+            }
         }
 
         lk.lock();
@@ -417,19 +450,56 @@ void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t 
     sl.seen[expert] = 1;
 }
 
-// link the materialized host tensor to its cache tensor (decode phase computes from the host tensor)
-void llama_moe_stream::set_host(ggml_tensor * cache, ggml_tensor * host) {
-    for (auto & sl : layers) {
-        if (!sl) {
+// layer-window mode: if the pool slot holds a different layer's bytes (or none), reset this
+// layer's slot state and claim the slot. the prior occupant's GEMMs finished before this point
+// (graph order, n_window >= 2), so overwriting is safe.
+void llama_moe_stream::claim_slot_locked(llama_moe_stream_layer & sl, uint32_t slot) {
+    if (n_window == 0 || window_pool_gen[slot] == sl.il) {
+        return;
+    }
+    if (debug) {
+        LLAMA_LOG_DEBUG("%s: layer %d claims pool slot %u (was layer %d)\n", __func__, sl.il, slot, window_pool_gen[slot]);
+    }
+    sl.expert_slot.clear();
+    std::fill(sl.slot_expert.begin(), sl.slot_expert.end(), -1);
+    std::fill(sl.slot_state.begin(), sl.slot_state.end(), LLAMA_MOE_STREAM_SLOT_EMPTY);
+    std::fill(sl.slot_claimed.begin(), sl.slot_claimed.end(), 0);
+    window_pool_gen[slot] = sl.il;
+}
+
+// layer-window mode: enqueue the next layer's FULL expert load without waiting (LvLLM's
+// prefetch-window trick — layer order is deterministic, so the copies overlap the current
+// layer's compute). the pool slot's prior occupant finished its GEMMs before this point.
+void llama_moe_stream::prefetch_layer(int32_t il) {
+    if (n_window == 0 || il < 0 || (size_t) il >= layers.size() || layers[il] == nullptr) {
+        return;
+    }
+    auto & sl = *layers[il];
+    std::unique_lock<std::mutex> lk(mtx);
+    start_workers_locked();
+    const uint32_t slot = (uint32_t) il % n_window;
+    claim_slot_locked(sl, slot);
+    if (!sl.expert_slot.empty()) {
+        return; // already loaded or loading for this layer
+    }
+    for (uint32_t e = 0; e < sl.n_expert; e++) {
+        const int32_t v = pick_victim_locked(sl, /*keep=*/nullptr);
+        if (v < 0) {
             continue;
         }
-        for (auto & w : sl->weights) {
-            if (w.cache == cache) {
-                w.host = host;
-                return;
-            }
-        }
+        reserve_slot_locked(sl, (int32_t) e, v);
+        q_demand.push_back({ &sl, (int32_t) e, v, sl.slot_gen[v] });
+        cv_work.notify_one();
     }
+}
+
+// link the materialized host tensor to its cache tensor (decode phase computes from the host tensor)
+void llama_moe_stream::set_host(int32_t il, ggml_tensor * host) {
+    // pool tensors are shared across layers in window mode, so the host link must target the
+    // weight entry just pushed by create_cache_tensor for this layer
+    auto & sl = layers[il];
+    GGML_ASSERT(sl && !sl->weights.empty());
+    sl->weights.back().host = host;
 }
 
 // page-lock the materialized host tensors so host->device copies use DMA instead of the driver's
@@ -547,6 +617,51 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     mgr->stats.n_calls++;
     mgr->start_workers_locked();
 
+    if (mgr->n_window > 0) {
+        // layer-window mode: the pool slot holds the FULL layer at identity slots (expert e ->
+        // slot e), so the load is routing-independent and valid across ubatches/warmup. wait for
+        // the load (prefetched from the previous layer), then pass the ids through unchanged.
+        mgr->claim_slot_locked(*sl, (uint32_t) sl->il % mgr->n_window);
+        if (sl->expert_slot.size() < sl->n_expert) {
+            sl->demand_slots.clear();
+            for (uint32_t e = 0; e < sl->n_expert; e++) {
+                if (sl->expert_slot.find(e) != sl->expert_slot.end()) {
+                    continue;
+                }
+                const int32_t v = mgr->pick_victim_locked(*sl, /*keep=*/nullptr);
+                if (v < 0) {
+                    break;
+                }
+                mgr->reserve_slot_locked(*sl, (int32_t) e, v);
+                sl->demand_slots.push_back(v);
+                mgr->q_demand.push_back({ sl, (int32_t) e, v, sl->slot_gen[v] });
+                mgr->cv_work.notify_one();
+            }
+            const int64_t t0 = ggml_time_us();
+            mgr->cv_done.wait(lk, [&]{
+                if (mgr->load_failed) {
+                    return true;
+                }
+                for (const int32_t s : sl->demand_slots) {
+                    if (sl->slot_state[s] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
+                        return false;
+                    }
+                }
+                return true;
+            });
+            if (mgr->load_failed) {
+                GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
+            }
+            mgr->stats.t_stall_us += ggml_time_us() - t0;
+        }
+        for (int64_t i = 0; i < n; i++) {
+            out[i] = ids[i];
+        }
+        lk.unlock();
+        mgr->prefetch_layer(sl->il + 1);
+        return;
+    }
+
     // distinct experts touched by this ubatch, in first-use order
     sl->touched.assign(sl->n_expert, 0);
     sl->uniq.clear();
@@ -641,6 +756,17 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         const int32_t s = sl->expert_slot.at(ids[i]);
         sl->slot_last_use[s] = ++sl->use_counter;
         out[i] = s;
+    }
+    if (mgr->n_window > 0 && sl->il < 2) {
+        fprintf(stderr, "DBG remapout il=%d n=%lld in[0..7]=%d,%d,%d,%d,%d,%d,%d,%d out[0..7]=%d,%d,%d,%d,%d,%d,%d,%d\n",
+                sl->il, (long long) n, ids[0],ids[1],ids[2],ids[3],ids[4],ids[5],ids[6],ids[7],
+                out[0],out[1],out[2],out[3],out[4],out[5],out[6],out[7]);
+    }
+
+    if (mgr->n_window > 0 && std::getenv("LLAMA_MOE_STREAM_NO_PREFETCH") == nullptr) {
+        // layer-window mode: prefetch the next layer's full expert set during this layer's compute
+        lk.unlock();
+        mgr->prefetch_layer(sl->il + 1);
     }
 }
 
