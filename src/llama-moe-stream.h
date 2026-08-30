@@ -128,11 +128,14 @@ struct llama_moe_stream {
     int32_t  n_io_threads = 0;
 
     // layer-window mode (LvLLM-style rolling residency): n_window pool slots, each holding one
-    // layer's FULL expert set; layer N's cache tensors are window_pool[N % n_window][k].
+    // layer's FULL expert set; layer N's cache tensors are window_pool[N % n_window][k]. the pool
+    // tensors are keyed by weight role + shape, so the weights of one layer (gate/up/down) never
+    // collide while layers of equal geometry share the slot machinery.
     // 0 = expert-slot mode (the PR #25294 machinery). No slot floor in window mode.
     uint32_t n_window = 0;
-    std::vector<std::vector<ggml_tensor *>> window_pool; // [slot][weight-index]
-    std::vector<int32_t> window_pool_gen;                // [slot] layer whose data it holds (-1 = none)
+    std::vector<std::vector<ggml_tensor *>> window_pool;      // [slot][weight-index]
+    std::vector<std::vector<std::string>>   window_pool_role; // [slot][weight-index] "ffn_gate_exps" etc.
+    std::vector<int32_t> window_pool_gen;                     // [slot] layer whose data it holds (-1 = none)
 
     std::vector<std::unique_ptr<llama_moe_stream_layer>> layers; // [n_layer], null = not streamed
 
