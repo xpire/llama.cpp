@@ -2139,10 +2139,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     ggml_tensor * ids_gemm = selected_experts;
-    if (msl && n_stream_waves == 1) {
+    if (msl && n_stream_waves == 1 && n_tokens > 1) {
         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
         ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
         cb(ids_gemm, "ffn_moe_topk_stream", il);
+    }
+
+    // decode phase (1-token ubatch): the expert GEMMs compute from the CPU-resident host tensors,
+    //   no cache slots, no remap; prefill streams them through the GPU cache instead
+    if (msl && n_tokens == 1) {
+        const ggml_tensor * h;
+        if ((h = msl->host_for(gate_up_exps)) != nullptr) { gate_up_exps = (ggml_tensor *) h; }
+        if ((h = msl->host_for(gate_exps))    != nullptr) { gate_exps    = (ggml_tensor *) h; }
+        if ((h = msl->host_for(up_exps))      != nullptr) { up_exps      = (ggml_tensor *) h; }
+        if ((h = msl->host_for(down_exps))    != nullptr) { down_exps    = (ggml_tensor *) h; }
     }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);

@@ -41,6 +41,7 @@ enum llama_moe_stream_slot_state : uint8_t {
 // one streamed weight tensor (gate/up/down or fused gate_up) of one layer
 struct llama_moe_stream_weight {
     ggml_tensor * cache = nullptr; // cache tensor {ne0, ne1, n_slots}
+    ggml_tensor * host  = nullptr; // fully materialized CPU tensor (decode phase uses this, not the cache)
 
     uint16_t file_idx  = 0; // GGUF split file index
     size_t   offs      = 0; // file offset of the full exps tensor data
@@ -101,6 +102,16 @@ struct llama_moe_stream_layer {
     // (e.g. grovemoe evaluates a second, unstreamed expert group on the same layer index)
     bool matches(const ggml_tensor * gate, const ggml_tensor * up,
                  const ggml_tensor * down, const ggml_tensor * gate_up) const;
+
+    // the fully materialized host tensor backing a cache tensor (decode phase), or nullptr
+    const ggml_tensor * host_for(const ggml_tensor * cache) const {
+        for (const auto & w : weights) {
+            if (w.cache == cache) {
+                return w.host;
+            }
+        }
+        return nullptr;
+    }
 };
 
 // one queued expert load
@@ -132,6 +143,9 @@ struct llama_moe_stream {
 
     // allocate the cache tensor buffers (after all create_cache_tensor calls)
     void alloc_bufs(bool no_alloc);
+
+    // link the materialized host tensor to its cache tensor (decode phase uses the host tensor)
+    void set_host(ggml_tensor * cache, ggml_tensor * host);
 
     // reopen the GGUF files for streaming reads
     void open_files(const std::vector<std::string> & paths);

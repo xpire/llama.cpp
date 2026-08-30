@@ -280,13 +280,11 @@ llama_context::llama_context(
                 __func__, model.moe_stream()->n_slots, cparams.n_ubatch);
 
         // op offload snapshots host weights to the device per graph split, which assumes they do
-        // not change during the graph - streamed caches are rewritten between waves
-        bool cache_on_host = false;
-        for (const auto & buf : model.moe_stream()->bufs) {
-            cache_on_host = cache_on_host || ggml_backend_buffer_is_host(buf.get());
-        }
-        if (cache_on_host && cparams.op_offload) {
-            LLAMA_LOG_WARN("%s: disabling op offload: the expert streaming cache is in host memory\n", __func__);
+        // not change during the graph - streamed caches are rewritten between waves, and the decode
+        // phase deliberately computes experts from CPU-resident host tensors (per-token snapshots
+        // to the GPU would defeat that), so op offload is incompatible with MoE expert streaming
+        if (cparams.op_offload) {
+            LLAMA_LOG_WARN("%s: disabling op offload with MoE expert streaming\n", __func__);
             cparams.op_offload = false;
         }
     }

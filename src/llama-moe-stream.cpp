@@ -215,7 +215,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
     }
     GGML_ASSERT(sl->n_expert == n_expert);
 
-    sl->weights.push_back({ cache, file_idx, offs, nb_expert });
+    sl->weights.push_back({ cache, nullptr, file_idx, offs, nb_expert });
 
     max_nb_expert = std::max(max_nb_expert, nb_expert);
 
@@ -340,12 +340,13 @@ void llama_moe_stream::worker_loop() {
 
         bool ok = true;
         for (const auto & wt : sl.weights) {
-            const uint8_t * data = llama_moe_stream_pread(*files[wt.file_idx], staging, wt.nb_expert, wt.offs + (size_t) w.expert*wt.nb_expert, use_direct_io);
-            if (data == nullptr) {
+            if (wt.host == nullptr) {
                 ok = false;
                 break;
             }
-            ggml_backend_tensor_set(wt.cache, data, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
+            // RAM -> device: copy the expert slab from the materialized host tensor into the cache
+            const uint8_t * src = (const uint8_t *) wt.host->data + (size_t) w.expert*wt.nb_expert;
+            ggml_backend_tensor_set(wt.cache, src, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
         }
 
         lk.lock();
@@ -407,8 +408,22 @@ void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t 
     sl.seen[expert] = 1;
 }
 
-size_t llama_moe_stream::size_bufs() const {
-    size_t size = 0;
+// link the materialized host tensor to its cache tensor (decode phase computes from the host tensor)
+void llama_moe_stream::set_host(ggml_tensor * cache, ggml_tensor * host) {
+    for (auto & sl : layers) {
+        if (!sl) {
+            continue;
+        }
+        for (auto & w : sl->weights) {
+            if (w.cache == cache) {
+                w.host = host;
+                return;
+            }
+        }
+    }
+}
+
+size_t llama_moe_stream::size_bufs() const {    size_t size = 0;
     for (const auto & buf : bufs) {
         size += ggml_backend_buffer_get_size(buf.get());
     }

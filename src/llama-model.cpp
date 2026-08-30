@@ -1960,17 +1960,23 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         }
 
         if (dims_ok) {
-            // register the skip so that the loader tensor accounting stays consistent; returns nullptr
-            ml.create_tensor(
-                hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
-                tn, ne, flags | TENSOR_STREAMED);
+            // materialize the full tensor in RAM (decode phase computes from it) and mirror it in the
+            //   streaming cache (prefill phase); the layer fields receive the cache tensor
+            ggml_tensor * host = ml.create_tensor(
+                hparams, &pimpl->cpu_buft_list, &pimpl->cpu_buft_list, &pimpl->cpu_buft_list, &pimpl->cpu_buft_list,
+                tn, ne, flags);
+            if (host == nullptr) {
+                return nullptr; // optional tensor absent in this model
+            }
 
             ggml_backend_buffer_type_t buft = llama_moe_stream_select_buft(hparams, w->tensor, buft_list_layer);
             if (buft == nullptr) {
                 throw std::runtime_error(format("failed to find a buffer type for streamed tensor %s", name.c_str()));
             }
 
-            return pimpl->moe_stream->create_cache_tensor(tn.bid, buft, w->tensor, w->idx, w->offs);
+            ggml_tensor * cache = pimpl->moe_stream->create_cache_tensor(tn.bid, buft, w->tensor, w->idx, w->offs);
+            pimpl->moe_stream->set_host(cache, host);
+            return cache;
         }
     }
 
