@@ -37,6 +37,7 @@ export interface ModelLoadProgress {
 	value: number;
 }
 
+// LLAMA-APP-REUSE: parsed model id shape
 export interface ParsedModelId {
 	raw: string;
 	orgName: string | null;

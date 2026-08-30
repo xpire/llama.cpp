@@ -16,6 +16,7 @@
  * - `limited`  -> fits only at a reduced context (yellow)
  * - `none`     -> does not fit even at the minimum context (red)
  */
+// LLAMA-APP-REUSE: hardware compatibility estimation
 
 import { browser } from '$app/environment';
 import { isAuxSidecar, type ModelSidecar } from '$lib/constants';
