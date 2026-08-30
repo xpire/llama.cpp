@@ -349,7 +349,11 @@ void llama_moe_stream::worker_loop() {
                 ok = false;
                 break;
             }
-            // RAM -> device: copy the expert slab from the materialized host tensor into the cache
+            // RAM -> device: copy the expert slab from the materialized host tensor into the cache.
+            //   set_tensor copies on cudaStreamPerThread (worker-local) and syncs — safe from worker
+            //   threads. M4-proper (async on the scheduler stream) requires the copies to be enqueued
+            //   by the scheduler thread (a graph-level copy op); worker-thread async stream enqueue
+            //   races with the main thread and segfaults (measured).
             const uint8_t * src = (const uint8_t *) wt.host->data + (size_t) w.expert*wt.nb_expert;
             ggml_backend_tensor_set(wt.cache, src, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
         }
