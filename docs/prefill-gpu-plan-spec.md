@@ -51,3 +51,26 @@ Attention: stays GPU-resident both phases (fits for A3B; for GLM-5.3-class needs
 - **RAM cost of host materialization**: +17 GB (A3B) / +140 GB (GLM-5.3, still fits 192 GB P720).
 - **Graph reuse**: phase switch must not poison the reuse cache (decode vs prefill graphs already differ by ubatch shape → `can_reuse` naturally separates them).
 - **Engagement gate**: parameterized (P2), default derived per model from F1/F3, not hardcoded 4096.
+
+## 6. Reference comparison — LvLLM / LSGLang (verified from READMEs, 2026-08-30)
+
+Their prefill acceleration stack:
+- `LVLLM_GPU_RESIDENT_MOE_LAYERS` — **layer-wise residency** (selected MoE layers loaded into VRAM and kept;
+  "linear speedup for decode and prefill"). Their mechanism is residency + prefetch, **not expert-slot
+  streaming** (our PR #25294 port). Residency is what their speedup comes from; streaming is more general
+  (any quant, any size) — different axes.
+- `LVLLM_GPU_PREFETCH_WINDOW=1-2` — prefetch layers N+1..N+window during layer N compute = **our M4**.
+  Confirmed as their core trick → M4 is high priority, not optional.
+- `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=4096` — batch gate; engages GPU prefill at input ≥ 4096.
+  Confirms the P2 parameterized gate (theirs is config-specific, not universal).
+- `LVLLM_ENABLE_MOE_LAYERWISE_LOAD=1` — layer-at-a-time loading to fit bigger resident sets in small VRAM.
+- NUMA CPU knobs (`LK_THREAD_BINDING`, `LK_THREADS`, `LVLLM_ENABLE_NUMA_INTERLEAVE`) for non-resident layers.
+- Benchmarks (V4-Flash, A3B-class, mxfp4): 850 t/s prefill on 2× 5060 Ti + dual EPYC 7642 (16ch);
+  1060 t/s on 2× 3090; 3100 t/s on 2× EPYC 9684x + Pro 6000. **All wins are 2-GPU, batch 8192-32768,
+  NUMA-server setups** — never a single 12 GB card. Corroborates F7 and the P720 direction.
+
+## 7. Spec deltas from the reference check
+
+- M4 (prefetch overlap) moves up in priority (their core lever).
+- P3 gains an alternative: LvLLM-style resident-layers + prefetch as a complement to slot streaming on the P720.
+- The phase split (prefill GPU / decode CPU) matches their v1.5.1+ "separation of prefill and decoding".
