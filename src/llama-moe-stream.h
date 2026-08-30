@@ -147,6 +147,10 @@ struct llama_moe_stream {
     // link the materialized host tensor to its cache tensor (decode phase uses the host tensor)
     void set_host(ggml_tensor * cache, ggml_tensor * host);
 
+    // page-lock the materialized host tensors so host->device copies use DMA (M4 / #26659);
+    // no-op unless a backend registers host buffers (CUDA gates on GGML_CUDA_REGISTER_HOST)
+    void pin_hosts();
+
     // reopen the GGUF files for streaming reads
     void open_files(const std::vector<std::string> & paths);
 
@@ -163,6 +167,12 @@ struct llama_moe_stream {
 
     std::vector<std::pair<ggml_backend_buffer_type_t, ggml_context_ptr>> ctxs; // one per buft
     std::vector<ggml_backend_buffer_ptr> bufs;
+
+    // pinned host tensors (M4); unregistered in the destructor
+    std::vector<ggml_tensor *> pinned;
+    void (*pinned_unreg)(void *) = nullptr;
+    // page-aligned buffer bases registered (whole-buffer registration; tensor data is not page-aligned)
+    std::vector<void *> pinned_bufs;
 
     // load pool (queue and all layer residency state guarded by mtx)
     mutable std::mutex      mtx;

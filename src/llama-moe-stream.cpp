@@ -159,6 +159,11 @@ llama_moe_stream::~llama_moe_stream() {
     for (auto & w : workers) {
         w.join();
     }
+    if (pinned_unreg != nullptr) {
+        for (void * base : pinned_bufs) {
+            pinned_unreg(base);
+        }
+    }
 }
 
 ggml_tensor * llama_moe_stream::create_cache_tensor(
@@ -420,6 +425,67 @@ void llama_moe_stream::set_host(ggml_tensor * cache, ggml_tensor * host) {
                 return;
             }
         }
+    }
+}
+
+// page-lock the materialized host tensors so host->device copies use DMA instead of the driver's
+// bounce buffer. resolved via ggml_backend_reg_get_proc_address so src/ gains no backend-specific
+// dependency; backends that do not provide it fall through unchanged (CUDA gates on
+// GGML_CUDA_REGISTER_HOST). registration makes pages non-pageable, so failures are ignored.
+void llama_moe_stream::pin_hosts() {
+    using reg_fn   = bool (*)(void *, size_t);
+    using unreg_fn = void (*)(void *);
+
+    reg_fn reg = nullptr;
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        ggml_backend_reg_t r = ggml_backend_reg_get(i);
+        if (r != nullptr) {
+            reg = (reg_fn) ggml_backend_reg_get_proc_address(r, "ggml_backend_register_host_buffer");
+            if (reg != nullptr) {
+                break;
+            }
+        }
+    }
+    if (reg == nullptr) {
+        return;
+    }
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        ggml_backend_reg_t r = ggml_backend_reg_get(i);
+        if (r != nullptr) {
+            pinned_unreg = (unreg_fn) ggml_backend_reg_get_proc_address(r, "ggml_backend_unregister_host_buffer");
+            if (pinned_unreg != nullptr) {
+                break;
+            }
+        }
+    }
+
+    size_t n_pinned = 0;
+    std::vector<ggml_backend_buffer_t> seen;
+    for (auto & sl : layers) {
+        if (!sl) {
+            continue;
+        }
+        for (auto & w : sl->weights) {
+            if (w.host == nullptr || w.host->buffer == nullptr) {
+                continue;
+            }
+            ggml_backend_buffer_t buf = w.host->buffer;
+            if (std::find(seen.begin(), seen.end(), buf) != seen.end()) {
+                continue; // register each host buffer once (tensor data is not page-aligned)
+            }
+            seen.push_back(buf);
+            void * base = ggml_backend_buffer_get_base(buf);
+            size_t size = ggml_backend_buffer_get_size(buf);
+            if (reg(base, size)) {
+                pinned_bufs.push_back(base);
+                n_pinned += size;
+            }
+        }
+    }
+
+    if (n_pinned > 0) {
+        LLAMA_LOG_INFO("%s: page-locked %.2f GiB of host expert buffers for DMA\n",
+                __func__, n_pinned / 1024.0 / 1024.0 / 1024.0);
     }
 }
 

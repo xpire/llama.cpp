@@ -1884,6 +1884,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         } else {
             pimpl->moe_stream->alloc_bufs(ml.no_alloc);
             if (!ml.no_alloc) {
+                pimpl->moe_stream->pin_hosts();
                 pimpl->moe_stream->open_files(ml.file_paths);
             }
         }
