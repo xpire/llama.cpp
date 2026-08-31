@@ -61,10 +61,16 @@ struct llama_moe_stream_layer {
     llama_moe_stream * mgr = nullptr;
 
     int32_t  il       = -1;
-    uint32_t n_expert = 0;
+    uint32_t n_expert = 0; // routed expert count (from the expert weights); the slot machinery size
     uint32_t n_slots  = 0;
 
-    std::vector<llama_moe_stream_weight> weights; // 2 (fused gate_up + down) or 3 entries
+    std::vector<llama_moe_stream_weight> weights;      // 2 (fused gate_up + down) or 3 entries
+    std::vector<llama_moe_stream_weight> attn_weights; // window mode: attention projections, one slab = whole tensor
+    bool last_is_attn = false;                         // the most recent create_cache_tensor call pushed an attention weight
+
+    // window-mode graph build state: the attention wait-op is inserted once per layer per build
+    // (the first streamed attention projection consumed by build_lora_mm); reset by begin_graph_build
+    bool wait_inserted = false;
 
     // residency state, guarded by mgr->mtx
     std::vector<int32_t>                 slot_expert;   // [n_slots] expert id or -1
@@ -110,7 +116,22 @@ struct llama_moe_stream_layer {
                 return w.host;
             }
         }
+        for (const auto & w : attn_weights) {
+            if (w.cache == cache) {
+                return w.host;
+            }
+        }
         return nullptr;
+    }
+
+    // whether the given tensor is one of this layer's streamed attention projections
+    bool is_attn_cache(const ggml_tensor * t) const {
+        for (const auto & w : attn_weights) {
+            if (w.cache == t) {
+                return true;
+            }
+        }
+        return false;
     }
 };
 
@@ -156,6 +177,19 @@ struct llama_moe_stream {
 
     // link the materialized host tensor to its cache tensor (decode phase uses the host tensor)
     void set_host(int32_t il, ggml_tensor * host);
+
+    // host tensor backing the given streamed cache tensor (decode phase), or nullptr
+    const ggml_tensor * host_for(const ggml_tensor * cache) const {
+        for (const auto & sl : layers) {
+            if (sl) {
+                const ggml_tensor * h = sl->host_for(cache);
+                if (h) {
+                    return h;
+                }
+            }
+        }
+        return nullptr;
+    }
 
     // page-lock the materialized host tensors so host->device copies use DMA (M4 / #26659);
     // no-op unless a backend registers host buffers (CUDA gates on GGML_CUDA_REGISTER_HOST)
@@ -210,6 +244,9 @@ struct llama_moe_stream {
         int64_t n_preload_issued = 0; // next-wave loads started during a wave's compute
         int64_t n_preload_ready  = 0; // wave experts already resident from the previous preload
         int64_t t_stall_wave_us  = 0; // wait time in wave miss handling
+
+        int64_t n_attn_waits     = 0; // attention wait-op invocations (window mode)
+        int64_t t_stall_attn_us  = 0; // wait time in the attention wait-op
     } stats;
 
     // internals
@@ -227,6 +264,20 @@ struct llama_moe_stream {
     // reset this layer's slot state and claim the slot for this layer. called under mtx.
     void claim_slot_locked(llama_moe_stream_layer & sl, uint32_t slot);
 
+    // layer-window mode: make the layer's pool slot resident (attention + experts), waiting for
+    // its loads. used by the remap (after the prefetch of the previous layer) and by the attention
+    // wait-op (the first consumer of the layer's pool slot). called under mtx, releases it on wait.
+    void ensure_layer_resident_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl);
+
+    // build_lora_mm hook: for window mode, the first streamed attention projection of a layer
+    // consumed by the graph (per build) returns the layer so the caller inserts the wait-op; later
+    // projections of the same layer return null (the slot is resident by then). null for decode
+    // (host tensors) and for expert-slot mode.
+    llama_moe_stream_layer * attn_wait(const ggml_tensor * w);
+
+    // called once per graph build (llama_model::build_graph): allow one attention wait-op per layer
+    void begin_graph_build();
+
     // multi-pass prefill helpers (called by llama_moe_stream_wave_ids, all under mtx)
     void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n); // wave 0: build the plan
     void stage_wave_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl, int32_t w, uint32_t n_ids); // make wave w resident + preload next
@@ -235,6 +286,10 @@ struct llama_moe_stream {
 
 // callback of the id-remapping custom op inserted by build_moe_ffn
 void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+
+// callback of the attention wait-op inserted by build_lora_mm (window mode): blocks until the
+// layer's pool slot holds its attention + expert weights, then passes the activations through
+void llama_moe_stream_wait(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
 
 // callbacks of the multi-pass prefill custom ops inserted by build_moe_ffn when a ubatch touches
 // more experts than the cache holds; each src[0] is the contiguous selected ids

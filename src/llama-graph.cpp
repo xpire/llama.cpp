@@ -1515,6 +1515,26 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+    // window-mode attention streaming: attention projections live in the rolling pool during
+    // prefill and compute from the materialized host tensors in decode. the wait-op (a no-op
+    // map_custom1 on cur) gates the first streamed attention GEMM of each layer on the pool
+    // slot's residency; the previous layer's remap prefetched the slot (attention first, it runs
+    // first in the layer), so the wait is short. inserted once per layer per graph build here -
+    // attention projections are consumed via this function only, no per-arch surgery needed.
+    if (mstream) {
+        if (ubatch.n_tokens == 1) {
+            const ggml_tensor * host = mstream->host_for(w);
+            if (host) {
+                w = (ggml_tensor *) host;
+            }
+        } else {
+            llama_moe_stream_layer * msl = mstream->attn_wait(w);
+            if (msl) {
+                cur = ggml_map_custom1(ctx0, cur, llama_moe_stream_wait, 1, msl);
+            }
+        }
+    }
+
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
     if (w_s) {

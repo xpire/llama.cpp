@@ -186,7 +186,13 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
     const uint32_t n_expert  = meta->ne[2];
     const size_t   nb_expert = ggml_nbytes(meta) / n_expert;
     GGML_ASSERT(nb_expert * n_expert == ggml_nbytes(meta));
-    GGML_ASSERT(n_slots > 0 && n_slots <= n_expert); // window mode: n_slots == n_expert
+
+    // window mode streams attention projections too: they have no expert dim (ne[2] == 1), the
+    // whole tensor is one slab, copied alongside the first expert of the layer load
+    const bool is_attn = n_window > 0 && n_expert == 1;
+    if (!is_attn) {
+        GGML_ASSERT(n_slots > 0 && n_slots <= n_expert); // window mode: n_slots == n_expert
+    }
 
     // layer-window mode holds a FULL layer per pool slot; expert mode holds n_slots slabs
     const uint32_t n_slots_eff = n_window > 0 ? n_expert : n_slots;
@@ -200,7 +206,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
     }
     if (ctx == nullptr) {
         ggml_init_params params = {
-            /*.mem_size   =*/ ggml_tensor_overhead()*(layers.size()*4 + 1),
+            /*.mem_size   =*/ ggml_tensor_overhead()*(layers.size()*8 + 1),
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true,
         };
@@ -227,18 +233,28 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
         auto & ws = window_pool[slot];
         auto & rs = window_pool_role[slot];
         const std::string role = llama_moe_stream_weight_role(meta);
-        cache = nullptr;
+        ggml_tensor * base = nullptr;
         for (size_t k = 0; k < ws.size(); k++) {
             ggml_tensor * t = ws[k];
             if (rs[k] == role && t->type == meta->type && t->ne[0] == meta->ne[0] && t->ne[1] == meta->ne[1]) {
-                cache = t;
+                base = t;
                 break;
             }
         }
-        if (cache == nullptr) {
-            cache = ggml_new_tensor_3d(ctx, meta->type, meta->ne[0], meta->ne[1], n_expert);
-            ws.push_back(cache);
+        if (base == nullptr) {
+            base = ggml_new_tensor_3d(ctx, meta->type, meta->ne[0], meta->ne[1], n_expert);
+            ws.push_back(base);
             rs.push_back(role);
+        }
+        // attention projections are consumed by build_lora_mm, which must find the CURRENT layer's
+        // host tensor in decode (the base tensor is shared across the layers of a window slot, so a
+        // pointer lookup would be ambiguous). give each layer a distinct view of the shared base -
+        // same memory, unambiguous identity. expert weights keep the shared base (their decode path
+        // is already layer-scoped in build_moe_ffn).
+        if (is_attn) {
+            cache = ggml_view_3d(ctx, base, base->ne[0], base->ne[1], base->ne[2], base->nb[1], base->nb[2], 0);
+        } else {
+            cache = base;
         }
         ggml_format_name(cache, "%s.stream_window", meta->name);
     } else {
@@ -252,20 +268,29 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
         sl = std::make_unique<llama_moe_stream_layer>();
         sl->mgr      = this;
         sl->il       = il;
-        sl->n_expert = n_expert;
-        sl->n_slots  = n_slots_eff;
-        sl->slot_expert  .resize(n_slots_eff, -1);
-        sl->slot_state   .resize(n_slots_eff, LLAMA_MOE_STREAM_SLOT_EMPTY);
-        sl->slot_claimed .resize(n_slots_eff, 0);
-        sl->slot_gen     .resize(n_slots_eff, 0);
-        sl->slot_last_use.resize(n_slots_eff, 0);
-        sl->route_hotness.resize(n_expert, 0);
-        sl->seen         .resize(n_expert, 0);
-        sl->keep         .resize(n_slots, 0);
+        // n_expert / slot arrays are sized when the first EXPERT weight registers (attention
+        // projections register first and are only slab lists, no slot machinery)
     }
-    GGML_ASSERT(sl->n_expert == n_expert);
-
-    sl->weights.push_back({ cache, nullptr, file_idx, offs, nb_expert });
+    if (is_attn) {
+        sl->attn_weights.push_back({ cache, nullptr, file_idx, offs, nb_expert });
+        sl->last_is_attn = true;
+    } else {
+        if (sl->n_slots == 0) {
+            sl->n_expert = n_expert;
+            sl->n_slots  = n_slots_eff;
+            sl->slot_expert  .resize(n_slots_eff, -1);
+            sl->slot_state   .resize(n_slots_eff, LLAMA_MOE_STREAM_SLOT_EMPTY);
+            sl->slot_claimed .resize(n_slots_eff, 0);
+            sl->slot_gen     .resize(n_slots_eff, 0);
+            sl->slot_last_use.resize(n_slots_eff, 0);
+            sl->route_hotness.resize(n_expert, 0);
+            sl->seen         .resize(n_expert, 0);
+            sl->keep         .resize(n_slots, 0);
+        }
+        GGML_ASSERT(sl->n_expert == n_expert);
+        sl->weights.push_back({ cache, nullptr, file_idx, offs, nb_expert });
+        sl->last_is_attn = false;
+    }
 
     max_nb_expert = std::max(max_nb_expert, nb_expert);
 
@@ -405,6 +430,19 @@ void llama_moe_stream::worker_loop() {
                 fprintf(stderr, "DBG copy il=%d wt=%s expert=%d slot=%d nb=%zu\n", sl.il, ggml_get_name(wt.cache), w.expert, w.slot, wt.nb_expert);
             }
         }
+        if (ok && w.expert == 0) {
+            // window mode: the layer's attention projections ride along with its first expert slab
+            for (const auto & wt : sl.attn_weights) {
+                if (wt.host == nullptr) {
+                    ok = false;
+                    break;
+                }
+                ggml_backend_tensor_set(wt.cache, wt.host->data, 0, wt.nb_expert);
+                if (debug) {
+                    fprintf(stderr, "DBG copy il=%d attn=%s nb=%zu\n", sl.il, ggml_get_name(wt.cache), wt.nb_expert);
+                }
+            }
+        }
 
         lk.lock();
 
@@ -482,6 +520,83 @@ void llama_moe_stream::claim_slot_locked(llama_moe_stream_layer & sl, uint32_t s
     window_pool_gen[slot] = sl.il;
 }
 
+// layer-window mode: make the layer's pool slot resident (attention + experts), waiting for its
+// loads. the previous layer's remap prefetched it (attention first - its copies ride on the first
+// expert slab), so the wait is short; the first touch of a layer (or the very first layer of a
+// prefill) reserves and demand-loads it here. the attention wait-op and the expert remap both
+// call this before the layer's GEMMs read the slot.
+void llama_moe_stream::ensure_layer_resident_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl) {
+    GGML_ASSERT(n_window > 0 && sl.n_expert > 0);
+    start_workers_locked(); // the attention wait-op of layer 0 is the first op of the graph - no remap started them yet
+    claim_slot_locked(sl, (uint32_t) sl.il % n_window);
+    if (sl.expert_slot.size() < sl.n_expert) {
+        // first touch of the layer (prefetch normally reserves the whole layer already)
+        for (uint32_t e = 0; e < sl.n_expert; e++) {
+            if (sl.expert_slot.find(e) != sl.expert_slot.end()) {
+                continue;
+            }
+            const int32_t v = pick_victim_locked(sl, /*keep=*/nullptr);
+            if (v < 0) {
+                break;
+            }
+            reserve_slot_locked(sl, (int32_t) e, v);
+            q_demand.push_back({ &sl, (int32_t) e, v, sl.slot_gen[v] });
+            cv_work.notify_one();
+        }
+    }
+    // the prefetch reserves the layer's slots (LOADING) from the previous layer's remap, which
+    // this call did not wait on - always wait for the full layer to be RESIDENT before the
+    // attention GEMMs read the pool slot
+    sl.demand_slots.clear();
+    for (uint32_t e = 0; e < sl.n_expert; e++) {
+        sl.demand_slots.push_back(sl.expert_slot.at(e));
+    }
+    const int64_t t0 = ggml_time_us();
+    cv_done.wait(lk, [&]{
+        if (load_failed) {
+            return true;
+        }
+        for (const int32_t s : sl.demand_slots) {
+            if (sl.slot_state[s] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
+                return false;
+            }
+        }
+        return true;
+    });
+    if (load_failed) {
+        GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
+    }
+}
+
+// build_lora_mm hook: for window mode, the first streamed attention projection of a layer
+// consumed by the graph (per build) returns the layer so the caller inserts the wait-op; later
+// projections of the same layer return null (the slot is resident by then). null for decode
+// (host tensors) and for expert-slot mode.
+llama_moe_stream_layer * llama_moe_stream::attn_wait(const ggml_tensor * w) {
+    if (n_window == 0) {
+        return nullptr;
+    }
+    for (auto & sl : layers) {
+        if (sl && sl->is_attn_cache(w)) {
+            if (sl->wait_inserted) {
+                return nullptr; // already gated this layer in this graph build
+            }
+            sl->wait_inserted = true;
+            return sl.get();
+        }
+    }
+    return nullptr;
+}
+
+// called once per graph build (llama_model::build_graph): allow one attention wait-op per layer
+void llama_moe_stream::begin_graph_build() {
+    for (auto & sl : layers) {
+        if (sl) {
+            sl->wait_inserted = false;
+        }
+    }
+}
+
 // layer-window mode: enqueue the next layer's FULL expert load without waiting (LvLLM's
 // prefetch-window trick — layer order is deterministic, so the copies overlap the current
 // layer's compute). the pool slot's prior occupant finished its GEMMs before this point.
@@ -513,8 +628,9 @@ void llama_moe_stream::set_host(int32_t il, ggml_tensor * host) {
     // pool tensors are shared across layers in window mode, so the host link must target the
     // weight entry just pushed by create_cache_tensor for this layer
     auto & sl = layers[il];
-    GGML_ASSERT(sl && !sl->weights.empty());
-    sl->weights.back().host = host;
+    GGML_ASSERT(sl && (!sl->weights.empty() || !sl->attn_weights.empty()));
+    llama_moe_stream_weight & w = sl->last_is_attn ? sl->attn_weights.back() : sl->weights.back();
+    w.host = host;
 }
 
 // page-lock the materialized host tensors so host->device copies use DMA instead of the driver's
@@ -589,6 +705,17 @@ void llama_moe_stream::print_stats() const {
     std::lock_guard<std::mutex> lock(mtx);
 
     const int64_t n_touched = stats.n_hit + stats.n_miss;
+    // direct dump: common_log is buffered and lost on exit
+    fprintf(stderr, "%s: moe stream: remap calls = %" PRId64 ", expert hits = %" PRId64 ", misses = %" PRId64 " (%" PRId64 " cold), hit rate = %.2f%%\n",
+            __func__, stats.n_calls, stats.n_hit, stats.n_miss, stats.n_miss_cold,
+            n_touched > 0 ? 100.0*stats.n_hit/n_touched : 0.0);
+    fprintf(stderr, "%s: moe stream: load stall = %.2f ms total (%.3f ms per remap call)\n",
+            __func__, stats.t_stall_us/1000.0, stats.n_calls > 0 ? stats.t_stall_us/1000.0/stats.n_calls : 0.0);
+    if (stats.n_attn_waits > 0) {
+        fprintf(stderr, "%s: moe stream: attention waits = %" PRId64 ", attn stall = %.2f ms total (%.3f ms per wait)\n",
+                __func__, stats.n_attn_waits, stats.t_stall_attn_us/1000.0, stats.n_attn_waits > 0 ? stats.t_stall_attn_us/1000.0/stats.n_attn_waits : 0.0);
+    }
+
     LLAMA_LOG_INFO("%s: moe stream: remap calls = %" PRId64 ", expert hits = %" PRId64 ", misses = %" PRId64 " (%" PRId64 " cold), hit rate = %.2f%%\n",
             __func__, stats.n_calls, stats.n_hit, stats.n_miss, stats.n_miss_cold,
             n_touched > 0 ? 100.0*stats.n_hit/n_touched : 0.0);
@@ -597,6 +724,10 @@ void llama_moe_stream::print_stats() const {
     if (stats.n_wave_calls > 0) {
         LLAMA_LOG_INFO("%s: moe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms\n",
                 __func__, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0);
+    }
+    if (stats.n_attn_waits > 0) {
+        LLAMA_LOG_INFO("%s: moe stream: attention waits = %" PRId64 ", attn stall = %.2f ms total (%.3f ms per wait)\n",
+                __func__, stats.n_attn_waits, stats.t_stall_attn_us/1000.0, stats.n_attn_waits > 0 ? stats.t_stall_attn_us/1000.0/stats.n_attn_waits : 0.0);
     }
 }
 
@@ -635,45 +766,10 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     if (mgr->n_window > 0) {
         // layer-window mode: the pool slot holds the FULL layer at identity slots (expert e ->
         // slot e), so the load is routing-independent and valid across ubatches/warmup. wait for
-        // the load (prefetched from the previous layer), then pass the ids through unchanged.
-        mgr->claim_slot_locked(*sl, (uint32_t) sl->il % mgr->n_window);
-        if (sl->expert_slot.size() < sl->n_expert) {
-            // first touch of the layer (prefetch normally reserves the whole layer already)
-            for (uint32_t e = 0; e < sl->n_expert; e++) {
-                if (sl->expert_slot.find(e) != sl->expert_slot.end()) {
-                    continue;
-                }
-                const int32_t v = mgr->pick_victim_locked(*sl, /*keep=*/nullptr);
-                if (v < 0) {
-                    break;
-                }
-                mgr->reserve_slot_locked(*sl, (int32_t) e, v);
-                mgr->q_demand.push_back({ sl, (int32_t) e, v, sl->slot_gen[v] });
-                mgr->cv_work.notify_one();
-            }
-        }
-        // the prefetch reserves the layer's slots (LOADING) from the previous layer's remap, which
-        // this call did not wait on - always wait for the full layer to be RESIDENT before the
-        // expert GEMMs read the pool slot
-        sl->demand_slots.clear();
-        for (uint32_t e = 0; e < sl->n_expert; e++) {
-            sl->demand_slots.push_back(sl->expert_slot.at(e));
-        }
+        // the load (prefetched from the previous layer, or demand-loaded by the attention wait-op
+        // that runs before this layer's attention GEMMs), then pass the ids through unchanged.
         const int64_t t0 = ggml_time_us();
-        mgr->cv_done.wait(lk, [&]{
-            if (mgr->load_failed) {
-                return true;
-            }
-            for (const int32_t s : sl->demand_slots) {
-                if (sl->slot_state[s] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
-                    return false;
-                }
-            }
-            return true;
-        });
-        if (mgr->load_failed) {
-            GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
-        }
+        mgr->ensure_layer_resident_locked(lk, *sl);
         mgr->stats.t_stall_us += ggml_time_us() - t0;
 
         for (int64_t i = 0; i < n; i++) {
@@ -788,6 +884,49 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     if (mgr->n_window > 0 && std::getenv("LLAMA_MOE_STREAM_NO_PREFETCH") == nullptr) {
         // layer-window mode: prefetch the next layer's full expert set during this layer's compute
         lk.unlock();
+        mgr->prefetch_layer(sl->il + 1);
+    }
+}
+
+// Custom-op callback of the attention wait-op (window mode): a no-op map_custom1 on the attention
+// input, inserted by build_lora_mm before the first streamed attention GEMM of each layer. it makes
+// the layer's pool slot resident - the previous layer's remap prefetched it, so the wait is short -
+// then passes the activations through unchanged. the graph orders it before the GEMM (data
+// dependency), so the GEMM cannot read unwritten pool memory.
+void llama_moe_stream_wait(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+
+    auto * sl  = (llama_moe_stream_layer *) userdata;
+    auto * mgr = sl->mgr;
+
+    GGML_ASSERT(a->type == dst->type);
+    GGML_ASSERT(ggml_are_same_shape(a, dst));
+
+    std::unique_lock<std::mutex> lk(mgr->mtx);
+
+    if (mgr->load_failed) {
+        GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
+    }
+
+    mgr->stats.n_attn_waits++;
+
+    const int64_t t0 = ggml_time_us();
+    mgr->ensure_layer_resident_locked(lk, *sl);
+    mgr->stats.t_stall_attn_us += ggml_time_us() - t0;
+
+    // no-op: pass the activations through unchanged
+    memcpy(dst->data, a->data, ggml_nbytes(a));
+    lk.unlock();
+
+    // prefetch the next layer HERE (start of this layer) so its load overlaps this layer's FULL
+    // compute (attention + experts); the remap also prefetches it (idempotent no-op). only safe
+    // for W >= 2: the next layer's slot differs from this layer's, and this layer's stream was
+    // drained by the wait-op's input copy, so overwriting the next slot is safe. at W=1 the remap
+    // prefetch (after this layer's attention GEMMs) is the correct trigger.
+    if (mgr->n_window >= 2) {
         mgr->prefetch_layer(sl->il + 1);
     }
 }

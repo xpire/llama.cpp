@@ -1414,19 +1414,34 @@ static bool llama_moe_stream_is_exps(llm_tensor tensor) {
     }
 }
 
+// window-mode attention streaming also routes the attention projections (attn_q/k/v/o, fused qkv);
+// they have no expert dim and are consumed by plain MUL_MAT via build_lora_mm
+static bool llama_moe_stream_is_attn(llm_tensor tensor) {
+    switch (tensor) {
+        case LLM_TENSOR_ATTN_Q:
+        case LLM_TENSOR_ATTN_K:
+        case LLM_TENSOR_ATTN_V:
+        case LLM_TENSOR_ATTN_OUT:
+        case LLM_TENSOR_ATTN_QKV:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // like select_weight_buft, but only consider each device's default buffer type: extra buffer
 //   types (e.g. CPU weight repacking) may not support the partial writes that slot-wise expert
 //   cache updates require
-static ggml_backend_buffer_type_t llama_moe_stream_select_buft(const llama_hparams & hparams, ggml_tensor * meta, const buft_list_t * buft_list) {
+static ggml_backend_buffer_type_t llama_moe_stream_select_buft(const llama_hparams & hparams, ggml_tensor * meta, const buft_list_t * buft_list, ggml_op op) {
     for (const auto & [dev, buft] : *buft_list) {
         if (buft != ggml_backend_dev_buffer_type(dev)) {
             continue;
         }
-        if (weight_buft_supported(hparams, meta, GGML_OP_MUL_MAT_ID, buft, dev)) {
+        if (weight_buft_supported(hparams, meta, op, buft, dev)) {
             return buft;
         }
     }
-    return select_weight_buft(hparams, meta, GGML_OP_MUL_MAT_ID, buft_list);
+    return select_weight_buft(hparams, meta, op, buft_list);
 }
 
 static bool llama_moe_stream_is_exps_name(const std::string & name) {
@@ -1950,14 +1965,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
 
-    // route MoE routed-expert weights to the streaming expert cache instead of materializing them
+    // route MoE routed-expert weights (and, in layer-window mode, the attention projections) to the
+    // streaming cache instead of materializing them on device: prefill reads them from the rolling
+    // pool, decode from the CPU host tensors. norms/embeddings/router stay resident.
+    const bool is_exps = llama_moe_stream_is_exps(tn.tensor);
+    const bool is_attn = params.moe_stream_window > 0 && llama_moe_stream_is_attn(tn.tensor);
     if (pimpl->moe_stream && tn.bid >= 0 && tn.bid < (int32_t) hparams.n_layer() && buft_list_layer != nullptr &&
         (flags & (TENSOR_DUPLICATED | TENSOR_SKIP | TENSOR_SKIP_IF_VIRTUAL)) == 0 &&
-        llama_moe_stream_is_exps(tn.tensor) && tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0) {
+        (is_exps || is_attn) && tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0) {
         const std::string name = tn.str();
         const auto * w = ml.get_weight(name.c_str());
 
-        bool dims_ok = w != nullptr && w->tensor->ne[2] == (int64_t) hparams.n_expert;
+        // attention projections have no expert dim (ne[2] == 1)
+        bool dims_ok = w != nullptr && w->tensor->ne[2] == (is_exps ? (int64_t) hparams.n_expert : 1);
         if (dims_ok) {
             size_t dim = 0;
             for (int64_t d : ne) {
@@ -1975,7 +1995,8 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
                 return nullptr; // optional tensor absent in this model
             }
 
-            ggml_backend_buffer_type_t buft = llama_moe_stream_select_buft(hparams, w->tensor, buft_list_layer);
+            // expert weights are consumed by MUL_MAT_ID, attention by plain MUL_MAT
+            ggml_backend_buffer_type_t buft = llama_moe_stream_select_buft(hparams, w->tensor, buft_list_layer, is_exps ? GGML_OP_MUL_MAT_ID : GGML_OP_MUL_MAT);
             if (buft == nullptr) {
                 throw std::runtime_error(format("failed to find a buffer type for streamed tensor %s", name.c_str()));
             }
@@ -2828,6 +2849,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 }
 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
+    // the attention wait-op is inserted once per streamed layer per graph build; graph reuse skips
+    // this function, so the flags survive into the reused graph's wait-ops
+    if (auto * mstream = moe_stream()) {
+        mstream->begin_graph_build();
+    }
+
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
     // add on pooling layer
