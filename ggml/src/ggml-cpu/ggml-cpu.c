@@ -722,6 +722,10 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 #endif
 }
 
+int ggml_numa_nodes(void) {
+    return g_state.numa.n_nodes;
+}
+
 bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
 }
@@ -1669,6 +1673,17 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     ggml_barrier(params->threadpool);
+
+    // NUMA thread-team affinity: with --numa distribute, pool thread ith is bound to node
+    //   ith % n_nodes (set_numa_thread_affinity). an op tagged with a numa_node runs on that
+    //   node's threads only; the others have hit the barrier above and can return — the working
+    //   threads no longer wait on them (the chunk loop is atomic-counter coordinated).
+    if (dst->numa_node >= 0) {
+        const int n_nodes = ggml_numa_nodes();
+        if (n_nodes > 0 && (ith % n_nodes) != dst->numa_node) {
+            return;
+        }
+    }
 
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];

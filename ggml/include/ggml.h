@@ -702,7 +702,12 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        char padding[8];
+        // NUMA thread-team affinity: the op executes on the threads of this node only
+        // (-1 = any thread). threads of other nodes still participate in the pool barriers
+        // but skip the compute. set by llama.cpp for tensor-split / EP shard ops.
+        int32_t numa_node;
+
+        char padding[4];
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);

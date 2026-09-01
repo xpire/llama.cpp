@@ -1,7 +1,29 @@
 # Single-Process NUMA — llama.cpp-native thread-team TP
 
-Branch `feat/prefill-gpu-ada` · 2026-09-02 · status: **proposal** (P720 measurements 2026-09-01)
+Branch `feat/prefill-gpu-ada` · 2026-09-02 · status: **P1 in progress** (P720 measurements 2026-09-01)
 Companion: [cpu-tp-numa-spec.md](cpu-tp-numa-spec.md) (multi-process TP — **superseded by this spec**), `research/llm-homelab-p520-flash-next-report.md`, `research/llm-homelab-to-sort-out.md` §5 (ktransformers NUMA port sizing)
+
+## 12. P1 implementation status (2026-09-02)
+
+**Findings (what already exists):** llama.cpp's `--numa distribute` implements thread affinity only
+(`set_numa_thread_affinity`: pool thread `ith` → node `ith % n_nodes`) — there is NO per-tensor memory
+placement in the loader, and no multi-CPU-device support. So the split's locality requires a new
+per-op thread-team mechanism.
+
+**Increment 1 — DONE (compiles, inert on single-node):**
+- `ggml_tensor.numa_node` (int32_t, default -1, absorbed into the trailing padding — ABI-stable)
+- `ggml_compute_forward_mul_mat_id`: after the pool barrier, threads not on `dst->numa_node`
+  return (barrier-synced, no work) — the chunk loop is atomic-counter coordinated, so a subset of
+  threads can do the work. `ggml_numa_nodes()` accessor added.
+- Inert until tensors are tagged + shard ops exist; the 1-node testbed cannot exercise it.
+
+**Increment 2 (next):** loader per-tensor `numa_node` tagging + `mbind` placement of the shard to
+the owning node (heap path first; mmap path via `MPOL_MF_MOVE`).
+**Increment 3:** graph — two `mul_mat_id` shard ops per expert set (tensor-split decode), each
+tagged with its node, + the intra-process combine (reuse `llama_tp_mask_ids_op` /
+`llama_tp_allreduce_op`).
+**Increment 4:** `--tp-mode <tensor|ep>` wiring; P720 validation (cross the 40 GB/s interleave
+ceiling).
 
 ## 1. TL;DR
 
