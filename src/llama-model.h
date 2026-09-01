@@ -11,6 +11,8 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -750,6 +752,8 @@ struct llama_model {
     // the pointee is mutable (residency changes during decode), only the pointer is owned here
     llama_moe_stream * moe_stream() const;
     llama_tp_context * tp() const;
+    // P1 inc-3: tensor-split shard registry (full expert tensor -> per-node shards)
+    const std::unordered_map<const ggml_tensor *, llama_numa_shard_pair> & tp_shards() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "llama-arch.h"
+#include "llama-model-loader.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -2510,6 +2511,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.mstream     =*/ model.moe_stream(),
         /*.tp          =*/ model.tp(),
+        /*.tp_shards   =*/ &model.tp_shards(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

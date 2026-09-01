@@ -18,6 +18,15 @@
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
+// P1 inc-3: per-node n_ff shards of a loaded expert tensor. shard data is a strided copy of
+// src's per-row halves (page-aligned heap, mbind'd to its node). data is owned by the caller and
+// must be freed with free(); the tensors live in `ctx` (caller-owned, must outlive the shards).
+struct llama_numa_shard_pair {
+    ggml_tensor * shards[2] = {nullptr, nullptr};
+    void * data             = nullptr;
+};
+llama_numa_shard_pair llama_numa_shard_tensor(const ggml_tensor * src, ggml_context * ctx);
+
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
 

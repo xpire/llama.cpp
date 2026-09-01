@@ -29,9 +29,17 @@ per-op thread-team mechanism.
   policy'd node), which IS the desired placement. The 1-node testbed cannot show migration; the P720
   `numastat` check is the proof: run with the env, then
   `numastat -p <pid>` / `grep "N1=" /proc/<pid>/numa_maps` — odd-layer expert pages must land on node 1.
-**Increment 3:** graph — two `mul_mat_id` shard ops per expert set (tensor-split decode), each
-tagged with its node, + the intra-process combine (reuse `llama_tp_mask_ids_op` /
-`llama_tp_allreduce_op`).
+**Increment 3 — DONE (2026-09-02, build + 1-node-inertness verified; P720 is the functional test):**
+- `llama_numa_shard_tensor()`: per-node n_ff shards of a loaded expert tensor (strided per-row
+  halves, page-aligned heap wrapped in `ggml_backend_cpu_buffer_from_ptr`, mbind'd, `numa_node`
+  0/1). model pimpl owns the shard ctx + data (freed on destruction).
+- `build_moe_ffn`: the expert-GEMM lambda is parameterized by its weight tensors; when the shard
+  registry matches (decode path — the host tensors are swapped in), the pipeline runs twice (one
+  per node's shard) and the expert outputs are added (the combine). `mul_mat_id`'s node check
+  falls back to the weight's `numa_node` (the GEMM outputs are untagged).
+- Gated: `LLAMA_NUMA_TENSOR_SPLIT=1` AND `ggml_numa_nodes() > 1` (inert on the single-node
+  testbed — verified no regression). Prefill/waves use the unsharded cache tensors (EP/link-bound
+  path unchanged); only decode (host-swap) takes the split path — per the spec.
 **Increment 4:** `--tp-mode <tensor|ep>` wiring; P720 validation (cross the 40 GB/s interleave
 ceiling).
 

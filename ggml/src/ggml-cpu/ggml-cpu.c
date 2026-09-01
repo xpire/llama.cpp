@@ -1678,9 +1678,11 @@ static void ggml_compute_forward_mul_mat_id(
     //   ith % n_nodes (set_numa_thread_affinity). an op tagged with a numa_node runs on that
     //   node's threads only; the others have hit the barrier above and can return — the working
     //   threads no longer wait on them (the chunk loop is atomic-counter coordinated).
-    if (dst->numa_node >= 0) {
+    const int32_t numa_node = dst->numa_node >= 0 ? dst->numa_node
+                                                 : (src0 && src0->numa_node >= 0 ? src0->numa_node : -1);
+    if (numa_node >= 0) {
         const int n_nodes = ggml_numa_nodes();
-        if (n_nodes > 0 && (ith % n_nodes) != dst->numa_node) {
+        if (n_nodes > 0 && (ith % n_nodes) != numa_node) {
             return;
         }
     }

@@ -1138,7 +1138,11 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() {
+        for (auto & [k, v] : tp_shards) {
+            free(v.data);
+        }
+    }
 
     uint64_t n_elements = 0;
 
@@ -1179,6 +1183,10 @@ struct llama_model::impl {
 
     // CPU tensor-parallel state, null when not enabled
     std::unique_ptr<llama_tp_context> tp;
+
+    // P1 inc-3: tensor-split shards (full expert tensor -> per-node shards) + owning ctx/data
+    std::unordered_map<const ggml_tensor *, llama_numa_shard_pair> tp_shards;
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> tp_shard_ctx{nullptr, ggml_free};
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -2015,6 +2023,22 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
                 host->numa_node = tn.bid % 2;
             }
 
+            // tensor-split NUMA (P1 inc-3): create per-node n_ff shards of the expert weights.
+            //   decode swaps these host tensors into the graph, which runs both shard GEMMs
+            //   (each on its node's threads via numa_node) and combines. gated to multi-node.
+            if (is_exps && ggml_numa_nodes() > 1 && getenv("LLAMA_NUMA_TENSOR_SPLIT") != nullptr) {
+                if (!pimpl->tp_shard_ctx) {
+                    ggml_init_params ip = { /*.mem_size=*/ ggml_tensor_overhead() * (2 * hparams.n_layer() * 4 + 16), /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
+                    pimpl->tp_shard_ctx.reset(ggml_init(ip));
+                }
+                llama_numa_shard_pair shards = llama_numa_shard_tensor(host, pimpl->tp_shard_ctx.get());
+                if (shards.shards[0] && shards.shards[1]) {
+                    pimpl->tp_shards[host] = shards;
+                } else {
+                    LLAMA_LOG_WARN("%s: expert sharding skipped for %s (n_ff not block-divisible?)\n", __func__, name.c_str());
+                }
+            }
+
             // expert weights are consumed by MUL_MAT_ID, attention by plain MUL_MAT
             ggml_backend_buffer_type_t buft = llama_moe_stream_select_buft(hparams, w->tensor, buft_list_layer, is_exps ? GGML_OP_MUL_MAT_ID : GGML_OP_MUL_MAT);
             if (buft == nullptr) {
@@ -2391,6 +2415,10 @@ llama_moe_stream * llama_model::moe_stream() const {
 
 llama_tp_context * llama_model::tp() const {
     return pimpl->tp.get();
+}
+
+const std::unordered_map<const ggml_tensor *, llama_numa_shard_pair> & llama_model::tp_shards() const {
+    return pimpl->tp_shards;
 }
 
 void llama_moe_stream_print_stats(const llama_model * model) {
