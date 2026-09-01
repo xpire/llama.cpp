@@ -589,6 +589,12 @@ struct common_params {
     bool     moe_stream_direct     = false; // use O_DIRECT for expert reads (bypass page cache)
     uint32_t moe_stream_window     = 0;     // layer-window streaming pool slots (0 = expert-slot mode)
 
+    // CPU tensor parallelism (expert-parallel MoE): ranks split the routed-expert compute and
+    //   all-reduce each layer's output over a POSIX-shm segment. CPU-only path.
+    int32_t     tp_size = 1;          // number of ranks (1 = disabled)
+    int32_t     tp_rank = 0;          // this rank's index
+    std::string tp_peer = "default";  // shm segment name shared by all ranks
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K

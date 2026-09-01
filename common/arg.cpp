@@ -2864,6 +2864,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_stream_window = value;
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_WINDOW"));
+    add_opt(common_arg(
+        {"--tp-size"}, "N",
+        "CPU tensor parallelism: number of ranks (expert-parallel MoE; CPU-only)",
+        [](common_params & params, int value) {
+            params.tp_size = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--tp-rank"}, "N",
+        "CPU tensor parallelism: this rank's index (0-based)",
+        [](common_params & params, int value) {
+            params.tp_rank = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--tp-peer"}, "NAME",
+        "CPU tensor parallelism: shm segment name shared by all ranks (must match)",
+        [](common_params & params, const std::string & value) {
+            params.tp_peer = value;
+        }
+    ));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

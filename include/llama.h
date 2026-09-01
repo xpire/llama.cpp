@@ -348,6 +348,13 @@ extern "C" {
         bool     moe_stream_direct;     // use O_DIRECT for expert reads (bypass page cache); falls back if unsupported
         uint32_t moe_stream_window;     // layer-window streaming: pool slots, each a full layer's experts (0 = expert-slot mode)
 
+        // CPU tensor parallelism (expert-parallel MoE): ranks split the routed-expert compute and
+        //   all-reduce each layer's output over a POSIX-shm segment. all ranks must pass the same
+        //   tp_peer name. the load is replicated across ranks (2x RAM). CPU-only path.
+        int32_t      tp_size;     // number of ranks (1 = disabled)
+        int32_t      tp_rank;     // this rank's index (0-based)
+        const char * tp_peer;     // shm segment name shared by all ranks
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data

@@ -18,6 +18,7 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 struct llama_moe_stream;
+struct llama_tp_context;
 
 // available models
 enum llm_type {
@@ -748,6 +749,7 @@ struct llama_model {
     // MoE expert SSD streaming state, null when not enabled
     // the pointee is mutable (residency changes during decode), only the pointer is owned here
     llama_moe_stream * moe_stream() const;
+    llama_tp_context * tp() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

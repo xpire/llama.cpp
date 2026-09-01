@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-tp.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -1175,6 +1176,9 @@ struct llama_model::impl {
 
     // MoE expert streaming state, null when not enabled
     std::unique_ptr<llama_moe_stream> moe_stream;
+
+    // CPU tensor-parallel state, null when not enabled
+    std::unique_ptr<llama_tp_context> tp;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1609,6 +1613,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_INFO("%s: MoE expert SSD streaming enabled, %u of %u experts cached per layer, %d I/O threads\n",
                     __func__, n_slots, hparams.n_expert, pimpl->moe_stream->n_io_threads);
         }
+    }
+
+    if (params.tp_size > 1) {
+        pimpl->tp = std::make_unique<llama_tp_context>();
+        if (!pimpl->tp->init(params.tp_size, params.tp_rank, params.tp_peer)) {
+            throw std::runtime_error("failed to initialize tensor-parallel transport");
+        }
+        LLAMA_LOG_INFO("%s: CPU tensor parallelism enabled, rank %d of %d (shm %s)\n",
+                __func__, params.tp_rank, params.tp_size, params.tp_peer ? params.tp_peer : "default");
     }
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
@@ -2361,6 +2374,10 @@ llama_moe_stream * llama_model::moe_stream() const {
     return pimpl->moe_stream.get();
 }
 
+llama_tp_context * llama_model::tp() const {
+    return pimpl->tp.get();
+}
+
 void llama_moe_stream_print_stats(const llama_model * model) {
     if (model && model->moe_stream()) {
         model->moe_stream()->print_stats();
@@ -2897,6 +2914,9 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_io_threads       =*/ 0,
         /*.moe_stream_direct           =*/ false,
         /*.moe_stream_window           =*/ 0,
+        /*.tp_size                     =*/ 1,
+        /*.tp_rank                     =*/ 0,
+        /*.tp_peer                     =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

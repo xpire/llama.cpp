@@ -380,6 +380,9 @@ struct cmd_params {
     uint64_t                         moe_stream_budget = 0;
     int32_t                          moe_stream_io_threads = 0;
     uint32_t                         moe_stream_window = 0;
+    int32_t                          tp_size = 1;
+    int32_t                          tp_rank = 0;
+    std::string                      tp_peer = "default";
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -764,6 +767,24 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 params.moe_stream = true;
                 params.moe_stream_window = std::stoul(argv[i]);
+            } else if (arg == "--tp-size") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.tp_size = std::stoi(argv[i]);
+            } else if (arg == "--tp-rank") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.tp_rank = std::stoi(argv[i]);
+            } else if (arg == "--tp-peer") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.tp_peer = argv[i];
             } else if (arg == "--moe-stream-io-threads") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1292,6 +1313,9 @@ struct cmd_params_instance {
     uint64_t           moe_stream_budget = 0;
     int32_t            moe_stream_io_threads = 0;
     uint32_t           moe_stream_window = 0;
+    int32_t            tp_size = 1;
+    int32_t            tp_rank = 0;
+    const char *       tp_peer = "default";
     llama_split_mode   split_mode;
     llama_load_mode    load_mode;
     llama_lazy_mode    lazy_mode;
@@ -1316,6 +1340,9 @@ struct cmd_params_instance {
         mparams.moe_stream_budget     = moe_stream_budget;
         mparams.moe_stream_io_threads = moe_stream_io_threads;
         mparams.moe_stream_window     = moe_stream_window;
+        mparams.tp_size = tp_size;
+        mparams.tp_rank = tp_rank;
+        mparams.tp_peer = tp_peer;
         if (!devices.empty()) {
             mparams.devices = const_cast<ggml_backend_dev_t *>(devices.data());
         }
@@ -1450,6 +1477,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .moe_stream_budget     = */ params.moe_stream_budget,
                 /* .moe_stream_io_threads = */ params.moe_stream_io_threads,
                 /* .moe_stream_window     = */ params.moe_stream_window,
+                /* .tp_size               = */ params.tp_size,
+                /* .tp_rank               = */ params.tp_rank,
+                /* .tp_peer               = */ params.tp_peer.c_str(),
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1492,6 +1522,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .moe_stream_budget     = */ params.moe_stream_budget,
                 /* .moe_stream_io_threads = */ params.moe_stream_io_threads,
                 /* .moe_stream_window     = */ params.moe_stream_window,
+                /* .tp_size               = */ params.tp_size,
+                /* .tp_rank               = */ params.tp_rank,
+                /* .tp_peer               = */ params.tp_peer.c_str(),
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1534,6 +1567,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .moe_stream_budget     = */ params.moe_stream_budget,
                 /* .moe_stream_io_threads = */ params.moe_stream_io_threads,
                 /* .moe_stream_window     = */ params.moe_stream_window,
+                /* .tp_size               = */ params.tp_size,
+                /* .tp_rank               = */ params.tp_rank,
+                /* .tp_peer               = */ params.tp_peer.c_str(),
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,

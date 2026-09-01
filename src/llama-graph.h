@@ -769,6 +769,7 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 class llm_graph_result;
 
 struct llama_moe_stream;
+struct llama_tp_context;
 
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -790,6 +791,9 @@ struct llm_graph_params {
 
     // MoE expert SSD streaming state of the model, null when not enabled
     llama_moe_stream * mstream = nullptr;
+
+    // CPU tensor-parallel state of the model, null when not enabled
+    llama_tp_context * tp = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1032,6 +1036,9 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     llama_moe_stream * mstream;
+
+    // CPU tensor-parallel state, null when not enabled
+    llama_tp_context * tp = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

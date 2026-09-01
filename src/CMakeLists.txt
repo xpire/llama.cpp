@@ -38,6 +38,7 @@ add_library(llama
             llama-model-saver.cpp
             llama-model.cpp
             llama-moe-stream.cpp
+            llama-tp.cpp
             llama-quant.cpp
             llama-sampler.cpp
             llama-vocab.cpp

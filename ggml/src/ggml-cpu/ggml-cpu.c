@@ -1646,7 +1646,15 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                if (i02 < 0) {
+                    // tensor-parallel EP: a negative id selects no expert; zero the output slice
+                    //   (the mmid kernels only write mapped rows, so unmapped dst is garbage)
+                    memset((char *) dst->data + iid1*dst->nb[1] + id*dst->nb[2], 0,
+                           (size_t) dst->ne[0] * ggml_element_size(dst));
+                    continue;
+                }
+
+                assert(i02 < n_as);
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;

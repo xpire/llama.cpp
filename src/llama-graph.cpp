@@ -6,6 +6,11 @@
 #include "llama-cparams.h"
 #include "llama-sampler.h"
 #include "llama-moe-stream.h"
+#include "llama-tp.h"
+
+// CPU tensor-parallel graph-op callbacks (defined at the end of this file)
+void llama_tp_mask_ids_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+void llama_tp_allreduce_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1489,6 +1494,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     mstream          (params.mstream),
+    tp               (params.tp),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1916,6 +1922,12 @@ ggml_tensor * llm_graph_context::build_ffn(
         cb(cur, "ffn_down_s", il);
     }
 
+    if (tp) {
+        // dense FFN tensor-parallel: sum the per-rank column partials (non-inplace, see moe)
+        cur = ggml_map_custom1(ctx0, cur, llama_tp_allreduce_op, 1, tp);
+        cb(cur, "ffn_out_tp", il);
+    }
+
     return cur;
 }
 
@@ -2159,7 +2171,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     ggml_tensor * ids_gemm = selected_experts;
-    if (msl && n_stream_waves == 1 && n_tokens > 1) {
+    if (tp && n_tokens > 0) {
+        // expert-parallel: each rank computes only its contiguous expert range; non-local ids are
+        //   masked to -1 (the mul_mat_id op zeroes those output slices). the routing weights keep
+        //   the original ids, so the masked (zero) expert outputs contribute nothing.
+        ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
+        ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_tp_mask_ids_op, 1, tp);
+        cb(ids_gemm, "ffn_moe_topk_tp", il);
+    } else if (msl && n_stream_waves == 1 && n_tokens > 1) {
         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
         ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
         cb(ids_gemm, "ffn_moe_topk_stream", il);
@@ -2413,6 +2432,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     cb(moe_out, "ffn_moe_out", il);
+
+    if (tp) {
+        // sum the per-rank expert partials (one shm all-reduce per MoE layer). non-inplace:
+        //   a fresh output tensor each execution so graph reuse cannot skip the op on one rank
+        moe_out = ggml_map_custom1(ctx0, moe_out, llama_tp_allreduce_op, 1, tp);
+        cb(moe_out, "ffn_moe_out_tp", il);
+    }
 
     return moe_out;
 }
@@ -3962,4 +3988,46 @@ int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buck
     relative_bucket += (relative_position < max_exact ? relative_position : relative_position_if_large);
 
     return relative_bucket;
+}
+
+// expert-parallel id mask: keep only this rank's contiguous expert range, everything else becomes
+// -1 (mul_mat_id zeroes the corresponding output slices). n_expert is inferred from the id range.
+void llama_tp_mask_ids_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    auto * tp = (llama_tp_context *) userdata;
+    GGML_ASSERT(a->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_are_same_shape(a, dst));
+    const int32_t * src = (const int32_t *) a->data;
+    int32_t * out = (int32_t *) dst->data;
+    const int64_t n = ggml_nelements(a);
+
+    int32_t n_expert = 1;
+    for (int64_t i = 0; i < n; i++) {
+        if (src[i] > n_expert) {
+            n_expert = src[i];
+        }
+    }
+    n_expert += 1; // ids are 0-based
+    const int32_t lo = tp->expert_lo(n_expert);
+    const int32_t hi = tp->expert_hi(n_expert);
+    for (int64_t i = 0; i < n; i++) {
+        const int32_t id = src[i];
+        out[i] = (id < lo || id >= hi) ? -1 : id;
+    }
+}
+
+// all-reduce op: sum the (f32) tensor across ranks, in place. one blocking shm barrier per layer.
+void llama_tp_allreduce_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    auto * tp = (llama_tp_context *) userdata;
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(a, dst));
+    memcpy(dst->data, a->data, ggml_nbytes(a)); // non-inplace: dst is a fresh tensor
+    tp->allreduce((float *) dst->data, ggml_nelements(dst));
 }

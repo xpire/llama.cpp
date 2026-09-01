@@ -1708,6 +1708,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_direct     = params.moe_stream_direct;
     mparams.moe_stream_window     = params.moe_stream_window;
 
+    mparams.tp_size = params.tp_size;
+    mparams.tp_rank = params.tp_rank;
+    mparams.tp_peer = params.tp_peer.c_str();
+
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {
