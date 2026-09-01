@@ -1,6 +1,11 @@
 # CPU Tensor Parallelism (rank = socket) — Plan Spec
 
-Branch: `feat/cpu-tp-numa` · 2026-08-30 · source: upstream RFC PR #25209 (withdrawn, diff reviewed) · companion: `research/llm-homelab-performance-estimate.md`, `research/llm-homelab-inference-performance.md`, `research/llm-homelab-fleet-plan.md`, `research/llm-homelab-vs-sglang-benchmark.md`
+> **SUPERSEDED 2026-09-02** by [cpu-tp-single-process-numa-spec.md](cpu-tp-single-process-numa-spec.md): the multi-process
+> approach fails on the P720 (process desync at the first decode, round 161 — two independent contexts take
+> different graph paths and the all-reduce rendezvous diverges). The locality goal is kept; the transport is
+> replaced by intra-process thread teams. Loader shard plan + F2/F4/F7 analysis carry over.
+
+Branch `feat/cpu-tp-numa` · 2026-08-30 · source: upstream RFC PR #25209 (withdrawn, diff reviewed) · companion: `research/llm-homelab-performance-estimate.md`, `research/llm-homelab-inference-performance.md`, `research/llm-homelab-fleet-plan.md`, `research/llm-homelab-vs-sglang-benchmark.md`
 
 ## 1. Goal
 
