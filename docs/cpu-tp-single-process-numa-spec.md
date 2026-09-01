@@ -17,8 +17,18 @@ per-op thread-team mechanism.
   threads can do the work. `ggml_numa_nodes()` accessor added.
 - Inert until tensors are tagged + shard ops exist; the 1-node testbed cannot exercise it.
 
-**Increment 2 (next):** loader per-tensor `numa_node` tagging + `mbind` placement of the shard to
-the owning node (heap path first; mmap path via `MPOL_MF_MOVE`).
+**Increment 2 — DONE (2026-09-02, validated mechanically):**
+- `llama_model_loader`: `llama_numa_mbind_tensor()` — raw `mbind` syscall (no libnuma), `MPOL_BIND`
+  + `MPOL_MF_MOVE`, applied in a post-load pass over every `numa_node`-tagged tensor.
+  Bug fixed during bring-up: `MPOL_MF_MOVE` is `(1<<1)`, not `(1<<4)` (EINVAL).
+- `llama_model_base::create_tensor`: env-gated tagging (`LLAMA_NUMA_PLACE_LAYER=1` → `numa_node =
+  tn.bid % 2`) on both the moe-stream host tensors and the normal load path — a mechanism test; the
+  real per-shard assignment arrives with the sharded loader.
+- Verified: tagging fires (blk.N tensors → node N%2), the pass runs, mbind applies. NOTE: mbind on
+  unfaulted mmap pages sets the policy silently (no node validation — pages fault later onto the
+  policy'd node), which IS the desired placement. The 1-node testbed cannot show migration; the P720
+  `numastat` check is the proof: run with the env, then
+  `numastat -p <pid>` / `grep "N1=" /proc/<pid>/numa_maps` — odd-layer expert pages must land on node 1.
 **Increment 3:** graph — two `mul_mat_id` shard ops per expert set (tensor-split decode), each
 tagged with its node, + the intra-process combine (reuse `llama_tp_mask_ids_op` /
 `llama_tp_allreduce_op`).

@@ -2008,6 +2008,13 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
                 return nullptr; // optional tensor absent in this model
             }
 
+            // NUMA placement test (P1 inc-2): with LLAMA_NUMA_PLACE_LAYER=1, tag each layer's
+            // expert host tensor to a node so the loader's mbind pass is exercised (validate with
+            // numastat). the final per-shard assignment arrives with the sharded loader (inc-3).
+            if (getenv("LLAMA_NUMA_PLACE_LAYER") != nullptr) {
+                host->numa_node = tn.bid % 2;
+            }
+
             // expert weights are consumed by MUL_MAT_ID, attention by plain MUL_MAT
             ggml_backend_buffer_type_t buft = llama_moe_stream_select_buft(hparams, w->tensor, buft_list_layer, is_exps ? GGML_OP_MUL_MAT_ID : GGML_OP_MUL_MAT);
             if (buft == nullptr) {
@@ -2020,9 +2027,17 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         }
     }
 
-    return ml.create_tensor(
+    ggml_tensor * tensor = ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
+
+    // NUMA placement test (P1 inc-2): with LLAMA_NUMA_PLACE_LAYER=1, tag every layer tensor to a
+    // node so the loader's mbind pass is exercised on real data (validate with numastat on the P720).
+    // the final per-shard assignment arrives with the sharded loader (inc-3).
+    if (getenv("LLAMA_NUMA_PLACE_LAYER") != nullptr && tensor != nullptr && tn.bid >= 0) {
+        tensor->numa_node = tn.bid % 2;
+    }
+    return tensor;
 }
 
 std::string llama_model::arch_name() const {

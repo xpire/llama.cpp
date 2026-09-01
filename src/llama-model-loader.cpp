@@ -1490,6 +1490,36 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
     return data;
 }
 
+#if defined(__linux__)
+#include <unistd.h>
+#include <cerrno>
+#include <sys/syscall.h>
+#include <sys/mman.h>
+#ifndef MPOL_BIND
+#define MPOL_BIND 2
+#endif
+#ifndef MPOL_MF_MOVE
+#define MPOL_MF_MOVE (1u << 1)
+#endif
+#endif
+
+// NUMA placement (P1 inc-2): migrate a numa-tagged tensor's pages to its owning node. raw mbind
+// syscall (no libnuma dep); MPOL_MF_MOVE works on heap and mmap'd ranges once pages are faulted in.
+static void llama_numa_mbind_tensor(struct ggml_tensor * tensor) {
+    if (tensor->numa_node < 0 || tensor->data == nullptr || ggml_nbytes(tensor) == 0) {
+        return;
+    }
+#if defined(__linux__)
+    const unsigned long nodemask = 1UL << tensor->numa_node;
+    const long rv = syscall(SYS_mbind, tensor->data, ggml_nbytes(tensor), MPOL_BIND,
+                            &nodemask, sizeof(nodemask) * 8, MPOL_MF_MOVE);
+    if (rv != 0) {
+        LLAMA_LOG_WARN("%s: mbind(%s) to node %d failed: %s\n",
+                __func__, ggml_get_name(tensor), (int) tensor->numa_node, strerror(errno));
+    }
+#endif
+}
+
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         llama_buf_map & bufs,
@@ -1771,6 +1801,11 @@ bool llama_model_loader::load_all_data(
     }
     if (validation_failed) {
         throw std::runtime_error("found tensors with invalid data");
+    }
+
+    // NUMA placement (P1 inc-2): migrate numa-tagged tensors to their owning node
+    for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        llama_numa_mbind_tensor(t);
     }
 
     // check if this is the last call and do final cleanup
