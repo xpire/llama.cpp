@@ -27,6 +27,8 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 
+#include <sys/mman.h>
+
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -2011,6 +2013,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 LLAMA_LOG_WARN("%s: NUMA tensor split disabled (partial sharding) — keeping full expert host tensors\n", __func__);
             }
         } else {
+            // file-direct copy source: under --numa the mapping was advised POSIX_MADV_RANDOM
+            //   (llama_mmap: first-touch page placement) — right for resident weights, but the
+            //   shard copy + verify scan each expert tensor sequentially once, and random advice
+            //   starves readahead (~70 MB/s vs disk speed on the P720's 165 GB V4-Flash). the
+            //   mapping is transient here (hosts alias it and are never read post-split), so
+            //   re-advise sequential for the copy + verify passes.
+#if defined(__linux__)
+            for (auto & mapping : ml.mappings) {
+                if (mapping->size() > 0) {
+                    posix_madvise(mapping->addr(), mapping->size(), POSIX_MADV_SEQUENTIAL);
+                }
+            }
+#endif
             for (auto & [host, shards] : pimpl->tp_shards) {
                 llama_numa_shard_copy(shards, host, shards.axis);
             }
