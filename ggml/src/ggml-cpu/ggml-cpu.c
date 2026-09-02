@@ -1556,6 +1556,10 @@ static void ggml_compute_forward_mul_mat_id(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    // NUMA thread-team affinity tag: dst or the weight (src0); -1 = no restriction
+    const int32_t numa_node = dst->numa_node >= 0 ? dst->numa_node
+                                                 : (src0 && src0->numa_node >= 0 ? src0->numa_node : -1);
+
     const enum ggml_type type = src0->type;
 
     const bool src1_cont = ggml_is_contiguous(src1);
@@ -1666,10 +1670,12 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
-    // reset current_chunk
+    // reset current_chunk. for a numa-node-tagged op only a thread subset works, so the shared
+    // counter starts at 0 and the working threads grab chunks via fetch-add (the ith-indexed
+    // assignment would leave the skipped threads' chunks uncomputed -> half-empty output).
     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
-        *current_chunk_ctr = nth;
+        *current_chunk_ctr = numa_node >= 0 ? 0 : nth;
     }
 
     ggml_barrier(params->threadpool);
@@ -1678,8 +1684,6 @@ static void ggml_compute_forward_mul_mat_id(
     //   ith % n_nodes (set_numa_thread_affinity). an op tagged with a numa_node runs on that
     //   node's threads only; the others have hit the barrier above and can return — the working
     //   threads no longer wait on them (the chunk loop is atomic-counter coordinated).
-    const int32_t numa_node = dst->numa_node >= 0 ? dst->numa_node
-                                                 : (src0 && src0->numa_node >= 0 ? src0->numa_node : -1);
     if (numa_node >= 0) {
         const int n_nodes = ggml_numa_nodes();
         if (n_nodes > 0 && (ith % n_nodes) != numa_node) {
@@ -1727,9 +1731,11 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
         const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
 
-        int current_chunk = ith;
-
         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+
+        int current_chunk = numa_node >= 0
+            ? atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed)
+            : ith;
 
         while (current_chunk < nchunk0 * nchunk1) {
             const int64_t ith0 = current_chunk % nchunk0;

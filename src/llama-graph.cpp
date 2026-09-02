@@ -2220,19 +2220,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //   level (BEFORE any nonlinearity) — running the whole pipeline twice and adding the final
     //   outputs would apply the gate/silu to each partial instead of the sum (wrong). the
     //   shards' numa_node routes each partial GEMM to its node's threads.
+    // NUMA tensor-split expert GEMM. the shards are ne[0] (n_ff) splits of the weight, so:
+    //   mode 0 (gate/up, output-split): shard x FULL input -> partial output rows -> CONCAT
+    //   mode 1 (down,  input-split):    shard x HALF  input -> partial contraction  -> ADD
     auto mm_sharded = [&](ggml_tensor * w, ggml_tensor * cur, ggml_tensor * ids_gemm,
-                          ggml_tensor * w_s, ggml_tensor * ids_scale, const char * tag) -> ggml_tensor * {
+                          ggml_tensor * w_s, ggml_tensor * ids_scale, const char * tag, int mode) -> ggml_tensor * {
         if (tp_shards != nullptr) {
             auto it = tp_shards->find(w);
             if (it != tp_shards->end()) {
                 const auto & sp = it->second;
                 ggml_tensor * r = nullptr;
                 for (int k = 0; k < 2; k++) {
-                    const int64_t k_half = cur->ne[0] / 2;
-                    ggml_tensor * ck = ggml_view_3d(ctx0, cur, k_half, cur->ne[1], cur->ne[2],
-                            cur->nb[1], cur->nb[2], (size_t) k * k_half * cur->nb[0]);
+                    ggml_tensor * ck = cur;
+                    if (mode == 1) {
+                        const int64_t k_half = cur->ne[0] / 2;
+                        ck = ggml_view_3d(ctx0, cur, k_half, cur->ne[1], cur->ne[2],
+                                cur->nb[1], cur->nb[2], (size_t) k * k_half * cur->nb[0]);
+                    }
                     ggml_tensor * pk = build_lora_mm_id(sp.shards[k], ck, ids_gemm, w_s, ids_scale);
-                    r = r == nullptr ? pk : ggml_add(ctx0, r, pk);
+                    r = r == nullptr ? pk : (mode == 1 ? ggml_add(ctx0, r, pk) : ggml_concat(ctx0, r, pk, 0));
                 }
                 cb(r, tag, il);
                 return r;
@@ -2245,7 +2251,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_w) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = mm_sharded(gate_up_w, cur, ids_gemm, up_exps_s, selected_experts, "ffn_moe_gate_up"); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = mm_sharded(gate_up_w, cur, ids_gemm, up_exps_s, selected_experts, "ffn_moe_gate_up", 0); // [n_ff*2, n_expert_used, n_tokens]
 
         if (up_exps_s) {
             cb(gate_up, "ffn_moe_gate_up_scaled", il);
@@ -2263,7 +2269,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = mm_sharded(up_w, cur, ids_gemm, up_exps_s, selected_experts, "ffn_moe_up"); // [n_ff, n_expert_used, n_tokens]
+        up = mm_sharded(up_w, cur, ids_gemm, up_exps_s, selected_experts, "ffn_moe_up", 0); // [n_ff, n_expert_used, n_tokens]
 
         if (up_exps_s) {
             cb(up, "ffn_moe_up_scaled", il);
@@ -2275,7 +2281,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_w) {
-            cur = mm_sharded(gate_w, cur, ids_gemm, gate_exps_s, selected_experts, "ffn_moe_gate"); // [n_ff, n_expert_used, n_tokens]
+            cur = mm_sharded(gate_w, cur, ids_gemm, gate_exps_s, selected_experts, "ffn_moe_gate", 0); // [n_ff, n_expert_used, n_tokens]
         } else {
             cur = up;
         }
@@ -2375,7 +2381,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = mm_sharded(down_w, cur, ids_gemm, down_exps_s, selected_experts, "ffn_moe_down"); // [n_embd, n_expert_used, n_tokens]
+    experts = mm_sharded(down_w, cur, ids_gemm, down_exps_s, selected_experts, "ffn_moe_down", 1); // [n_embd, n_expert_used, n_tokens]
 
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);
