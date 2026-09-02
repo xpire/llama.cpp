@@ -5,6 +5,14 @@ Companion: [cpu-tp-numa-spec.md](cpu-tp-numa-spec.md) (multi-process TP — **su
 
 ## 12. P1 implementation status (2026-09-02)
 
+**VALIDATED on the P720 (2026-09-02):** tensor-split decode produces BYTE-IDENTICAL output to the
+unsplit path (llama-cli oracle, seed 42, t=16, env on/off — `diff` empty). The full P1 mechanism is
+proven end-to-end on 2-node hardware: per-op `numa_node` affinity (inc-1), mbind placement + tagging
+(inc-2), n_ff shards + two-GEMM combine (inc-3). A3B decode 9.9 vs 9.8 t/s — flat, as predicted for
+the latency-bound small-GEMM model. MTP spec decode on the A3B: **5x regression** (1.1 vs 5.7 t/s) —
+no compute headroom on no-VNNI 6138s, per research gotcha. Remaining: A10B (mid-active) + V4-Flash
+(bandwidth-bound) decode tests — the locality payoff is expected to appear with active size.
+
 **Findings (what already exists):** llama.cpp's `--numa distribute` implements thread affinity only
 (`set_numa_thread_affinity`: pool thread `ith` → node `ith % n_nodes`) — there is NO per-tensor memory
 placement in the loader, and no multi-CPU-device support. So the split's locality requires a new
