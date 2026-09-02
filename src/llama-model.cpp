@@ -2011,6 +2011,41 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             for (auto & [host, shards] : pimpl->tp_shards) {
                 llama_numa_shard_copy(shards, host, shards.axis);
             }
+            if (getenv("LLAMA_NUMA_VERIFY") != nullptr) {
+                // byte-exactness check: reconstruct the host from its shards per the axis and compare
+                for (auto & [host, sh] : pimpl->tp_shards) {
+                    const size_t total = ggml_nbytes(host);
+                    std::vector<uint8_t> re(total, 0);
+                    const uint8_t * h0 = (const uint8_t *) sh.shards[0]->data;
+                    const uint8_t * h1 = (const uint8_t *) sh.shards[1]->data;
+                    if (sh.axis == 1) {
+                        const size_t nb_e = total / host->ne[2];
+                        const size_t nh  = nb_e / 2;
+                        for (int64_t e = 0; e < host->ne[2]; e++) {
+                            memcpy(&re[(size_t) e*nb_e],          h0 + (size_t) e*nh, nh);
+                            memcpy(&re[(size_t) e*nb_e + nh],     h1 + (size_t) e*nh, nh);
+                        }
+                    } else {
+                        const size_t rs  = ggml_row_size(host->type, host->ne[0]);
+                        const size_t rsh = ggml_row_size(host->type, host->ne[0]/2);
+                        const int64_t nr = host->ne[1] * host->ne[2];
+                        for (int64_t r = 0; r < nr; r++) {
+                            memcpy(&re[(size_t) r*rs],          h0 + (size_t) r*rsh, rsh);
+                            memcpy(&re[(size_t) r*rs + rsh],    h1 + (size_t) r*rsh, rsh);
+                        }
+                    }
+                    const uint8_t * hsrc = (const uint8_t *) host->data;
+                    if (memcmp(re.data(), hsrc, total) != 0) {
+                        size_t bad = 0;
+                        while (bad < total && re[bad] == hsrc[bad]) bad++;
+                        fprintf(stderr, "TPDBG shard MISMATCH %s axis %d at byte %zu/%zu\n",
+                                ggml_get_name(host), sh.axis, bad, total);
+                    } else {
+                        fprintf(stderr, "TPDBG shard OK %s axis %d (%zu bytes)\n",
+                                ggml_get_name(host), sh.axis, total);
+                    }
+                }
+            }
             for (auto & buf : pimpl->tp_host_bufs) {
                 ggml_backend_buffer_free(buf);
             }
