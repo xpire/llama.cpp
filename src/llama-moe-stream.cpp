@@ -272,7 +272,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
         // projections register first and are only slab lists, no slot machinery)
     }
     if (is_attn) {
-        sl->attn_weights.push_back({ cache, nullptr, file_idx, offs, nb_expert });
+        sl->attn_weights.push_back({ cache, nullptr, {nullptr, nullptr}, file_idx, offs, nb_expert });
         sl->last_is_attn = true;
     } else {
         if (sl->n_slots == 0) {
@@ -288,7 +288,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
             sl->keep         .resize(n_slots, 0);
         }
         GGML_ASSERT(sl->n_expert == n_expert);
-        sl->weights.push_back({ cache, nullptr, file_idx, offs, nb_expert });
+        sl->weights.push_back({ cache, nullptr, {nullptr, nullptr}, file_idx, offs, nb_expert });
         sl->last_is_attn = false;
     }
 
@@ -424,8 +424,20 @@ void llama_moe_stream::worker_loop() {
             //   threads. M4-proper (async on the scheduler stream) requires the copies to be enqueued
             //   by the scheduler thread (a graph-level copy op); worker-thread async stream enqueue
             //   races with the main thread and segfaults (measured).
-            const uint8_t * src = (const uint8_t *) wt.host->data + (size_t) w.expert*wt.nb_expert;
-            ggml_backend_tensor_set(wt.cache, src, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
+            if (wt.shards[0] != nullptr && wt.shards[1] != nullptr) {
+                // P1 fix: NUMA split — the host buffer is released post-load, so the expert slab is
+                //   assembled from the two per-node shards (each holds half of every row)
+                const size_t nb_half = wt.nb_expert / 2;
+                ggml_backend_tensor_set(wt.cache,
+                        (const uint8_t *) wt.shards[0]->data + (size_t) w.expert*nb_half,
+                        (size_t) w.slot*wt.nb_expert, nb_half);
+                ggml_backend_tensor_set(wt.cache,
+                        (const uint8_t *) wt.shards[1]->data + (size_t) w.expert*nb_half,
+                        (size_t) w.slot*wt.nb_expert + nb_half, nb_half);
+            } else {
+                const uint8_t * src = (const uint8_t *) wt.host->data + (size_t) w.expert*wt.nb_expert;
+                ggml_backend_tensor_set(wt.cache, src, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
+            }
             if (n_window > 0 && debug) {
                 fprintf(stderr, "DBG copy il=%d wt=%s expert=%d slot=%d nb=%zu\n", sl.il, ggml_get_name(wt.cache), w.expert, w.slot, wt.nb_expert);
             }
@@ -624,13 +636,15 @@ void llama_moe_stream::prefetch_layer(int32_t il) {
 }
 
 // link the materialized host tensor to its cache tensor (decode phase computes from the host tensor)
-void llama_moe_stream::set_host(int32_t il, ggml_tensor * host) {
+void llama_moe_stream::set_host(int32_t il, ggml_tensor * host, ggml_tensor * sh0, ggml_tensor * sh1) {
     // pool tensors are shared across layers in window mode, so the host link must target the
     // weight entry just pushed by create_cache_tensor for this layer
     auto & sl = layers[il];
     GGML_ASSERT(sl && (!sl->weights.empty() || !sl->attn_weights.empty()));
     llama_moe_stream_weight & w = sl->last_is_attn ? sl->attn_weights.back() : sl->weights.back();
-    w.host = host;
+    w.host  = host;
+    w.shards[0] = sh0;
+    w.shards[1] = sh1;
 }
 
 // page-lock the materialized host tensors so host->device copies use DMA instead of the driver's

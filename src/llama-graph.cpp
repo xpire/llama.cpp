@@ -2213,10 +2213,39 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
+    // P1 inc-3 (geometry fix): when a weight has a NUMA shard registry entry (decode path — the
+    //   moe-stream host tensors are swapped in), run the GEMM once per node: each node's team
+    //   multiplies its K-half of the weight with the corresponding K-half view of the
+    //   activations, and the partial results are added. the combine must happen at the GEMM
+    //   level (BEFORE any nonlinearity) — running the whole pipeline twice and adding the final
+    //   outputs would apply the gate/silu to each partial instead of the sum (wrong). the
+    //   shards' numa_node routes each partial GEMM to its node's threads.
+    auto mm_sharded = [&](ggml_tensor * w, ggml_tensor * cur, ggml_tensor * ids_gemm,
+                          ggml_tensor * w_s, ggml_tensor * ids_scale, const char * tag) -> ggml_tensor * {
+        if (tp_shards != nullptr) {
+            auto it = tp_shards->find(w);
+            if (it != tp_shards->end()) {
+                const auto & sp = it->second;
+                ggml_tensor * r = nullptr;
+                for (int k = 0; k < 2; k++) {
+                    const int64_t k_half = cur->ne[0] / 2;
+                    ggml_tensor * ck = ggml_view_3d(ctx0, cur, k_half, cur->ne[1], cur->ne[2],
+                            cur->nb[1], cur->nb[2], (size_t) k * k_half * cur->nb[0]);
+                    ggml_tensor * pk = build_lora_mm_id(sp.shards[k], ck, ids_gemm, w_s, ids_scale);
+                    r = r == nullptr ? pk : ggml_add(ctx0, r, pk);
+                }
+                cb(r, tag, il);
+                return r;
+            }
+        }
+        ggml_tensor * r = build_lora_mm_id(w, cur, ids_gemm, w_s, ids_scale);
+        cb(r, tag, il);
+        return r;
+    };
+
     if (gate_up_w) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_w, cur, ids_gemm, up_exps_s, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
-        cb(gate_up, "ffn_moe_gate_up", il);
+        ggml_tensor * gate_up = mm_sharded(gate_up_w, cur, ids_gemm, up_exps_s, selected_experts, "ffn_moe_gate_up"); // [n_ff*2, n_expert_used, n_tokens]
 
         if (up_exps_s) {
             cb(gate_up, "ffn_moe_gate_up_scaled", il);
@@ -2234,8 +2263,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_w, cur, ids_gemm, up_exps_s, selected_experts); // [n_ff, n_expert_used, n_tokens]
-        cb(up, "ffn_moe_up", il);
+        up = mm_sharded(up_w, cur, ids_gemm, up_exps_s, selected_experts, "ffn_moe_up"); // [n_ff, n_expert_used, n_tokens]
 
         if (up_exps_s) {
             cb(up, "ffn_moe_up_scaled", il);
@@ -2247,8 +2275,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_w) {
-            cur = build_lora_mm_id(gate_w, cur, ids_gemm, gate_exps_s, selected_experts); // [n_ff, n_expert_used, n_tokens]
-            cb(cur, "ffn_moe_gate", il);
+            cur = mm_sharded(gate_w, cur, ids_gemm, gate_exps_s, selected_experts, "ffn_moe_gate"); // [n_ff, n_expert_used, n_tokens]
         } else {
             cur = up;
         }
@@ -2348,8 +2375,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_w, cur, ids_gemm, down_exps_s, selected_experts); // [n_embd, n_expert_used, n_tokens]
-    cb(experts, "ffn_moe_down", il);
+    experts = mm_sharded(down_w, cur, ids_gemm, down_exps_s, selected_experts, "ffn_moe_down"); // [n_embd, n_expert_used, n_tokens]
 
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);
@@ -2391,36 +2417,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_build_forward_expand(gf, experts);
         }
     } else {
-        if (tp_shards != nullptr) {
-            const auto iu  = up_exps     ? tp_shards->find(up_exps)     : tp_shards->end();
-            const auto ig  = gate_exps   ? tp_shards->find(gate_exps)   : tp_shards->end();
-            const auto id  = down_exps   ? tp_shards->find(down_exps)   : tp_shards->end();
-            const auto iug = gate_up_exps ? tp_shards->find(gate_up_exps) : tp_shards->end();
-            if (iu != tp_shards->end() || iug != tp_shards->end()) {
-                // tensor-split (P1 inc-3): run the expert pipeline on each node's n_ff shard, then
-                //   combine. the shards' numa_node routes each GEMM to its node's threads.
-                const llama_numa_shard_pair & su = iu  != tp_shards->end() ? iu->second  : llama_numa_shard_pair{};
-                const llama_numa_shard_pair & sg = ig  != tp_shards->end() ? ig->second  : llama_numa_shard_pair{};
-                const llama_numa_shard_pair & sd = id  != tp_shards->end() ? id->second  : llama_numa_shard_pair{};
-                const llama_numa_shard_pair & sug = iug != tp_shards->end() ? iug->second : llama_numa_shard_pair{};
-                ggml_tensor * e0 = build_expert_gemms(cur, ids_gemm,
-                        su.shards[0] ? su.shards[0] : up_exps,
-                        sg.shards[0] ? sg.shards[0] : gate_exps,
-                        sd.shards[0] ? sd.shards[0] : down_exps,
-                        sug.shards[0] ? sug.shards[0] : gate_up_exps);
-                ggml_tensor * e1 = build_expert_gemms(cur, ids_gemm,
-                        su.shards[1] ? su.shards[1] : up_exps,
-                        sg.shards[1] ? sg.shards[1] : gate_exps,
-                        sd.shards[1] ? sd.shards[1] : down_exps,
-                        sug.shards[1] ? sug.shards[1] : gate_up_exps);
-                experts = ggml_add(ctx0, e0, e1);
-                cb(experts, "ffn_moe_tp_combine", il);
-            } else {
-                experts = build_expert_gemms(cur, ids_gemm, up_exps, gate_exps, down_exps, gate_up_exps);
-            }
-        } else {
-            experts = build_expert_gemms(cur, ids_gemm, up_exps, gate_exps, down_exps, gate_up_exps);
-        }
+        // tensor-split (P1 inc-3): the expert pipeline runs once; any weight with a shard registry
+        //   entry (decode path — moe-stream swapped the host tensors in) is computed per node
+        //   inside build_expert_gemms via mm_sharded (weight shard x cur K-half, ggml_add combine)
+        experts = build_expert_gemms(cur, ids_gemm, up_exps, gate_exps, down_exps, gate_up_exps);
     }
 
     if (down_exps_b) {

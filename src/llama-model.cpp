@@ -1139,8 +1139,14 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 struct llama_model::impl {
     impl() = default;
     ~impl() {
+        // join the moe-stream I/O workers before freeing the shard data they may be copying from
+        // (the stream is a member, so it would otherwise be destroyed AFTER this body)
+        moe_stream.reset();
         for (auto & [k, v] : tp_shards) {
             free(v.data);
+        }
+        for (auto & buf : tp_host_bufs) {
+            ggml_backend_buffer_free(buf);
         }
     }
 
@@ -1187,6 +1193,14 @@ struct llama_model::impl {
     // P1 inc-3: tensor-split shards (full expert tensor -> per-node shards) + owning ctx/data
     std::unordered_map<const ggml_tensor *, llama_numa_shard_pair> tp_shards;
     std::unique_ptr<ggml_context, decltype(&ggml_free)> tp_shard_ctx{nullptr, ggml_free};
+
+    // P1 fix: all-or-nothing NUMA tensor split. true when any expert failed to shard -> the whole
+    // split is disabled and the full host tensors stay resident. when fully engaged, each sharded
+    // host tensor lives in its own buffer (tp_host_bufs) so it can be released once the shards are
+    // copied from it after load; the host tensor objects remain as registry keys (data dangling,
+    // never read — the graph's shard path uses the shards).
+    bool tp_split_partial = false;
+    std::vector<ggml_backend_buffer_t> tp_host_bufs;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1974,6 +1988,37 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // P1 fix: finalize the NUMA tensor split now that the host tensors hold their loaded data.
+    //   all-or-nothing: if any expert failed to shard, drop the shards entirely and keep the full
+    //   host tensors (the graph must never see a freed host). when fully engaged, copy the loaded
+    //   host data into the shards and release the host buffers — resident expert memory is then
+    //   the shards only (~1x model size instead of 2x).
+    if (!pimpl->tp_shards.empty()) {
+        if (ml.no_alloc || pimpl->tp_split_partial) {
+            for (auto & [k, v] : pimpl->tp_shards) {
+                free(v.data);
+            }
+            pimpl->tp_shards.clear();
+            if (!ml.no_alloc) {
+                LLAMA_LOG_WARN("%s: NUMA tensor split disabled (partial sharding) — keeping full expert host tensors\n", __func__);
+            }
+        } else {
+            for (auto & [host, shards] : pimpl->tp_shards) {
+                llama_numa_shard_copy(shards, host);
+            }
+            for (auto & buf : pimpl->tp_host_bufs) {
+                ggml_backend_buffer_free(buf);
+            }
+            pimpl->tp_host_bufs.clear();
+            for (auto & [host, shards] : pimpl->tp_shards) {
+                // the host tensor object stays alive as the registry key; only its (freed) data
+                // pointer is dangled. the graph's shard path never reads it.
+                const_cast<ggml_tensor *>(host)->buffer = nullptr;
+            }
+            LLAMA_LOG_INFO("%s: NUMA tensor split engaged — expert host tensors released, %zu shard pairs resident\n", __func__, pimpl->tp_shards.size());
+        }
+    }
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
@@ -2009,8 +2054,24 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         if (dims_ok) {
             // materialize the full tensor in RAM (decode phase computes from it) and mirror it in the
             //   streaming cache (prefill phase); the layer fields receive the cache tensor
+            const bool tp_split = is_exps && ggml_numa_nodes() > 1 && getenv("LLAMA_NUMA_TENSOR_SPLIT") != nullptr;
+            const buft_list_t * host_buft_list = &pimpl->cpu_buft_list;
+            buft_list_t cpu_plain_list; // P1 fix: plain-CPU-only list for sharded hosts
+            if (tp_split) {
+                // with the split engaged the host is only a copy source (decode computes from the
+                // shards), and the shard copy needs the FILE layout. the CPU_REPACK buft rewrites
+                // the data to a kernel layout on load, which would make the strided copy garbage;
+                // also, re-homing every host out of the repack ctx would empty it (its allocator
+                // then returns NULL). keep the host in the plain CPU buft instead.
+                for (const auto & e : pimpl->cpu_buft_list) {
+                    if (e.second == ggml_backend_dev_buffer_type(e.first)) {
+                        cpu_plain_list.push_back(e);
+                    }
+                }
+                host_buft_list = &cpu_plain_list;
+            }
             ggml_tensor * host = ml.create_tensor(
-                hparams, &pimpl->cpu_buft_list, &pimpl->cpu_buft_list, &pimpl->cpu_buft_list, &pimpl->cpu_buft_list,
+                hparams, host_buft_list, host_buft_list, host_buft_list, host_buft_list,
                 tn, ne, flags);
             if (host == nullptr) {
                 return nullptr; // optional tensor absent in this model
@@ -2026,16 +2087,30 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
             // tensor-split NUMA (P1 inc-3): create per-node n_ff shards of the expert weights.
             //   decode swaps these host tensors into the graph, which runs both shard GEMMs
             //   (each on its node's threads via numa_node) and combines. gated to multi-node.
-            if (is_exps && ggml_numa_nodes() > 1 && getenv("LLAMA_NUMA_TENSOR_SPLIT") != nullptr) {
+            //   the shard DATA is copied post-load (llama_numa_shard_copy in load_tensors) —
+            //   src->data is not loaded yet at create time. the host is re-homed into its own
+            //   buffer so it can be released once the shards exist (otherwise it shares the CPU
+            //   buffer with the rest of the model and cannot be freed independently).
+            if (tp_split) {
                 if (!pimpl->tp_shard_ctx) {
                     ggml_init_params ip = { /*.mem_size=*/ ggml_tensor_overhead() * (2 * hparams.n_layer() * 4 + 16), /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
                     pimpl->tp_shard_ctx.reset(ggml_init(ip));
+                }
+                ggml_backend_buffer_t host_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(host));
+                if (host_buf != nullptr) {
+                    // pre-allocating the host skips it in the shared-ctx buffer allocator below
+                    ggml_backend_tensor_alloc(host_buf, host, ggml_backend_buffer_get_base(host_buf));
+                    pimpl->tp_host_bufs.push_back(host_buf);
+                } else {
+                    pimpl->tp_split_partial = true;
                 }
                 llama_numa_shard_pair shards = llama_numa_shard_tensor(host, pimpl->tp_shard_ctx.get());
                 if (shards.shards[0] && shards.shards[1]) {
                     pimpl->tp_shards[host] = shards;
                 } else {
-                    LLAMA_LOG_WARN("%s: expert sharding skipped for %s (n_ff not block-divisible?)\n", __func__, name.c_str());
+                    // all-or-nothing: any expert that cannot shard disables the split entirely
+                    pimpl->tp_split_partial = true;
+                    LLAMA_LOG_WARN("%s: expert sharding failed for %s (n_ff not block-divisible?) — NUMA tensor split will be disabled\n", __func__, name.c_str());
                 }
             }
 
@@ -2046,6 +2121,14 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
             }
 
             ggml_tensor * cache = pimpl->moe_stream->create_cache_tensor(tn.bid, buft, w->tensor, w->idx, w->offs);
+            if (tp_split) {
+                auto it = pimpl->tp_shards.find(host);
+                if (it != pimpl->tp_shards.end()) {
+                    // split engaged for this host: workers source cache slabs from the shards
+                    pimpl->moe_stream->set_host(tn.bid, host, it->second.shards[0], it->second.shards[1]);
+                    return cache;
+                }
+            }
             pimpl->moe_stream->set_host(tn.bid, host);
             return cache;
         }

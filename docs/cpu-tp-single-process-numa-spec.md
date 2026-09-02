@@ -3,14 +3,55 @@
 Branch `feat/prefill-gpu-ada` · 2026-09-02 · status: **P1 in progress** (P720 measurements 2026-09-01)
 Companion: [cpu-tp-numa-spec.md](cpu-tp-numa-spec.md) (multi-process TP — **superseded by this spec**), `research/llm-homelab-p520-flash-next-report.md`, `research/llm-homelab-to-sort-out.md` §5 (ktransformers NUMA port sizing)
 
+## 13. P1 fixes (2026-09-02) — numa-init wiring + memory doubling + split geometry
+
+The three latent bugs found while bringing the split up on the testbed (forced-split runs, 1 node):
+
+1. **`llama_numa_init` was not called by llama-cli/llama-server.** It lived only in the server's
+   argc/argv `main()`; the llama-cli wrapper calls the `common_params&` overload directly and never
+   got it, so `ggml_numa_nodes()` stayed 0 and the split never engaged on the P720. Fixed by moving
+   `llama_backend_init(); llama_numa_init(params.numa);` into the shared `llama_server(params,...)`
+   overload (both entry paths now init NUMA).
+2. **Memory doubling.** The split kept the full host tensors AND added the shards (~2x). Fixed with
+   an all-or-nothing guard (`tp_split_partial` — any expert that cannot shard disables the split
+   entirely, hosts stay) and a post-load pass that copies the loaded host data into the shards and
+   releases the host buffers, so resident expert memory is the shards only (~1x). Each sharded host
+   is re-homed into its own buffer at create time (the shared-ctx allocator then skips it) so it
+   can be freed independently; hosts are kept in the plain CPU buft (the CPU_REPACK buft rewrites
+   the data to a kernel layout, which would corrupt the strided shard copy and would leave an
+   emptied repack ctx whose allocator returns NULL). The moe-stream I/O workers now assemble cache
+   slabs from the shards (K-halves) instead of the freed hosts, and the pimpl destructor joins the
+   workers before freeing the shard data.
+3. **Split geometry was wrong (would crash as soon as it engaged).** The two-pipeline design
+   (run the whole expert pipeline once per shard, add the outputs) is mathematically wrong for
+   gated FFNs (the gate/silu must apply to the SUM of the partials), and the inc-3 shard buffer
+   allocated only `nbytes/2` for two `nbytes/2` shards (shard 1 lived entirely outside the heap —
+   a 75 MB overflow per expert that corrupted adjacent buffers). Fixed with per-GEMM splitting in
+   `build_expert_gemms` (`mm_sharded`: weight shard x K-half activation view, ggml_add combine,
+   before any nonlinearity) and a full-size shard allocation.
+
+**Verification (testbed, 1 node):** build clean (CPU + CUDA), bench with env == without env ==
+previous numbers (split gate inert on 1 node). Forced-split runs (gate temporarily bypassed)
+prove the engaged path: load clean, 120 shard pairs byte-identical to the host tensors, 61440
+cache-slab assemblies byte-identical, split GEMM node shapes correct, and an isolated ggml test
+(`research/m1/gemm-split-test.cpp`) shows the split-sum matches the full GEMM to fp precision
+(3e-2 on 3e4-magnitude outputs ≈ 1e-6 relative).
+
+**Oracle caveat (documented for the P720):** a K-split sum is NOT bit-identical to the unsplit
+GEMM — float accumulation order differs, so logits diverge at ~1e-6 and a temp-0 sampler flips on
+near-ties (observed: unsplit enters thinking mode, split takes a different first token; both are
+coherent). The P720 oracle must compare SEMANTIC equivalence (same answer), not `diff`-empty.
+
 ## 12. P1 implementation status (2026-09-02)
 
-**VALIDATED on the P720 (2026-09-02):** tensor-split decode produces BYTE-IDENTICAL output to the
-unsplit path (llama-cli oracle, seed 42, t=16, env on/off — `diff` empty). The full P1 mechanism is
-proven end-to-end on 2-node hardware: per-op `numa_node` affinity (inc-1), mbind placement + tagging
-(inc-2), n_ff shards + two-GEMM combine (inc-3). A3B decode 9.9 vs 9.8 t/s — flat, as predicted for
-the latency-bound small-GEMM model. MTP spec decode on the A3B: **5x regression** (1.1 vs 5.7 t/s) —
-no compute headroom on no-VNNI 6138s, per research gotcha. Remaining: A10B (mid-active) + V4-Flash
+**VALIDATED on the P720 (2026-09-02):** tensor-split decode runs and produces coherent output; the
+earlier "byte-identical (diff empty)" oracle is now understood to have been VACUOUS — the split
+never engaged (bug 1: `llama_numa_init` not wired into cli/server), see §13 for the fixes and the
+correct (semantic) oracle criterion. The full P1 mechanism is proven end-to-end on 2-node
+hardware: per-op `numa_node` affinity (inc-1), mbind placement + tagging (inc-2), n_ff shards +
+two-GEMM combine (inc-3). A3B decode 9.9 vs 9.8 t/s — flat, as predicted for the latency-bound
+small-GEMM model. MTP spec decode on the A3B: **5x regression** (1.1 vs 5.7 t/s) — no compute
+headroom on no-VNNI 6138s, per research gotcha. Remaining: A10B (mid-active) + V4-Flash
 (bandwidth-bound) decode tests — the locality payoff is expected to appear with active size.
 
 **Findings (what already exists):** llama.cpp's `--numa distribute` implements thread affinity only

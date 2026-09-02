@@ -106,14 +106,18 @@ int llama_server(int argc, char ** argv) {
         return 1;
     }
 
-    llama_backend_init();
-    llama_numa_init(params.numa);
-
     return llama_server(params, argc, argv);
 }
 
 int llama_server(common_params & params, int argc, char ** argv) {
     bool is_run_by_cli = (argv == nullptr);
+
+    // P1 fix (numa-init wiring): initialize the backend + NUMA state here (not only in the
+    // argc/argv entry point) so the llama-cli server-wrapper path — which calls this overload
+    // directly and never goes through main() — also gets --numa handling. without it,
+    // ggml_numa_nodes() stays 0 and the NUMA tensor split never engages.
+    llama_backend_init();
+    llama_numa_init(params.numa);
 
     common_models_handler models_handler;
 
