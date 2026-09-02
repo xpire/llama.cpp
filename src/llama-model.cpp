@@ -2095,21 +2095,28 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
             // materialize the full tensor in RAM (decode phase computes from it) and mirror it in the
             //   streaming cache (prefill phase); the layer fields receive the cache tensor
             const bool tp_split = is_exps && ggml_numa_nodes() > 1 && getenv("LLAMA_NUMA_TENSOR_SPLIT") != nullptr;
+
+            // P1 fix (moe-stream CPU-only corruption): the streamed host is a FILE-layout copy
+            //   SOURCE for the I/O workers (per-expert slabs) and for the shard copy under the
+            //   split — it must not be repacked. the loader's normal selection picks the
+            //   CPU_REPACK extra buft first on CPU-only builds (AVX-512), which rewrites the host
+            //   data to a kernel layout; the workers then copy those repacked bytes into the
+            //   FILE-layout cache, corrupting every prefilled expert slab (the "WBK loop"). drop
+            //   the CPU extra (repack) bufts from the host's list — GPU builds keep the pinned
+            //   host buft (it precedes the extras and is DMA-optimal), CPU-only falls to the
+            //   plain CPU buft. also: re-homing every host out of the repack ctx would empty it
+            //   (its allocator then returns NULL), so the plain buft is required for the split.
             const buft_list_t * host_buft_list = &pimpl->cpu_buft_list;
-            buft_list_t cpu_plain_list; // P1 fix: plain-CPU-only list for sharded hosts
-            if (tp_split) {
-                // with the split engaged the host is only a copy source (decode computes from the
-                // shards), and the shard copy needs the FILE layout. the CPU_REPACK buft rewrites
-                // the data to a kernel layout on load, which would make the strided copy garbage;
-                // also, re-homing every host out of the repack ctx would empty it (its allocator
-                // then returns NULL). keep the host in the plain CPU buft instead.
-                for (const auto & e : pimpl->cpu_buft_list) {
-                    if (e.second == ggml_backend_dev_buffer_type(e.first)) {
-                        cpu_plain_list.push_back(e);
-                    }
+            buft_list_t host_buft_no_repack;
+            for (const auto & e : pimpl->cpu_buft_list) {
+                if (e.second == ggml_backend_dev_buffer_type(e.first) || ggml_backend_buft_is_host(e.second)) {
+                    host_buft_no_repack.push_back(e);
                 }
-                host_buft_list = &cpu_plain_list;
             }
+            if (!host_buft_no_repack.empty()) {
+                host_buft_list = &host_buft_no_repack;
+            }
+
             ggml_tensor * host = ml.create_tensor(
                 hparams, host_buft_list, host_buft_list, host_buft_list, host_buft_list,
                 tn, ne, flags);

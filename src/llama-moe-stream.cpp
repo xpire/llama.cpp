@@ -272,7 +272,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
         // projections register first and are only slab lists, no slot machinery)
     }
     if (is_attn) {
-        sl->attn_weights.push_back({ cache, nullptr, {nullptr, nullptr}, file_idx, offs, nb_expert });
+        sl->attn_weights.push_back({ cache, nullptr, {nullptr, nullptr}, /*shard_axis=*/-1, file_idx, offs, nb_expert });
         sl->last_is_attn = true;
     } else {
         if (sl->n_slots == 0) {
@@ -288,7 +288,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
             sl->keep         .resize(n_slots, 0);
         }
         GGML_ASSERT(sl->n_expert == n_expert);
-        sl->weights.push_back({ cache, nullptr, {nullptr, nullptr}, file_idx, offs, nb_expert });
+        sl->weights.push_back({ cache, nullptr, {nullptr, nullptr}, /*shard_axis=*/-1, file_idx, offs, nb_expert });
         sl->last_is_attn = false;
     }
 
@@ -620,6 +620,13 @@ void llama_moe_stream::begin_graph_build() {
 // layer's compute). the pool slot's prior occupant finished its GEMMs before this point.
 void llama_moe_stream::prefetch_layer(int32_t il) {
     if (n_window == 0 || il < 0 || (size_t) il >= layers.size() || layers[il] == nullptr) {
+        return;
+    }
+    if (n_window == 1) {
+        // P1 fix: a 1-slot window shares the pool with the CURRENT layer — prefetching the next
+        //   layer here would overwrite the slot while this layer's GEMMs still read it (a rare
+        //   corruption race: temp-0 runs occasionally diverge/EOS). with no spare slot there is
+        //   nothing to overlap; the next layer demand-loads at its own remap instead.
         return;
     }
     auto & sl = *layers[il];
