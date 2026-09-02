@@ -48,6 +48,7 @@ struct llama_moe_stream_weight {
     //   host (the host buffer is released post-load), and the graph's shard registry (keyed on the
     //   host pointer) redirects decode to the shards.
     ggml_tensor * shards[2] = {nullptr, nullptr};
+    int shard_axis = -1; // 0 = down (input-split, per-row halves); 1 = gate/up (output-split, blocks)
 
     uint16_t file_idx  = 0; // GGUF split file index
     size_t   offs      = 0; // file offset of the full exps tensor data
@@ -184,7 +185,7 @@ struct llama_moe_stream {
     // link the materialized host tensor to its cache tensor (decode phase uses the host tensor);
     // sh0/sh1 attach the NUMA split shards (K-halves) so the I/O workers can source cache slabs
     // from them once the host buffer is released post-load
-    void set_host(int32_t il, ggml_tensor * host, ggml_tensor * sh0 = nullptr, ggml_tensor * sh1 = nullptr);
+    void set_host(int32_t il, ggml_tensor * host, ggml_tensor * sh0 = nullptr, ggml_tensor * sh1 = nullptr, int axis = -1);
 
     // host tensor backing the given streamed cache tensor (decode phase), or nullptr
     const ggml_tensor * host_for(const ggml_tensor * cache) const {

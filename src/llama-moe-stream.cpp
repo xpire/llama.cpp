@@ -642,7 +642,7 @@ void llama_moe_stream::prefetch_layer(int32_t il) {
 }
 
 // link the materialized host tensor to its cache tensor (decode phase computes from the host tensor)
-void llama_moe_stream::set_host(int32_t il, ggml_tensor * host, ggml_tensor * sh0, ggml_tensor * sh1) {
+void llama_moe_stream::set_host(int32_t il, ggml_tensor * host, ggml_tensor * sh0, ggml_tensor * sh1, int axis) {
     // pool tensors are shared across layers in window mode, so the host link must target the
     // weight entry just pushed by create_cache_tensor for this layer
     auto & sl = layers[il];
@@ -651,6 +651,7 @@ void llama_moe_stream::set_host(int32_t il, ggml_tensor * host, ggml_tensor * sh
     w.host  = host;
     w.shards[0] = sh0;
     w.shards[1] = sh1;
+    w.shard_axis = axis;
 }
 
 // page-lock the materialized host tensors so host->device copies use DMA instead of the driver's

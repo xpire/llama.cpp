@@ -2131,7 +2131,7 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
                 auto it = pimpl->tp_shards.find(host);
                 if (it != pimpl->tp_shards.end()) {
                     // split engaged for this host: workers source cache slabs from the shards
-                    pimpl->moe_stream->set_host(tn.bid, host, it->second.shards[0], it->second.shards[1]);
+                    pimpl->moe_stream->set_host(tn.bid, host, it->second.shards[0], it->second.shards[1], it->second.axis);
                     return cache;
                 }
             }
