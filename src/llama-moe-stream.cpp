@@ -426,14 +426,20 @@ void llama_moe_stream::worker_loop() {
             //   races with the main thread and segfaults (measured).
             if (wt.shards[0] != nullptr && wt.shards[1] != nullptr) {
                 // P1 fix: NUMA split — the host buffer is released post-load, so the expert slab is
-                //   assembled from the two per-node shards (each holds half of every row)
-                const size_t nb_half = wt.nb_expert / 2;
-                ggml_backend_tensor_set(wt.cache,
-                        (const uint8_t *) wt.shards[0]->data + (size_t) w.expert*nb_half,
-                        (size_t) w.slot*wt.nb_expert, nb_half);
-                ggml_backend_tensor_set(wt.cache,
-                        (const uint8_t *) wt.shards[1]->data + (size_t) w.expert*nb_half,
-                        (size_t) w.slot*wt.nb_expert + nb_half, nb_half);
+                //   assembled from the two per-node shards (each holds half of every row).
+                //   the halves must INTERLEAVE per row (cache = [row0h0 row0h1 row1h0 row1h1 ...]);
+                //   concatenating the two shard blocks reorders every row and corrupts the weights.
+                const size_t nb_half  = wt.nb_expert / 2;
+                const int64_t n_rows  = wt.cache->ne[1]; // rows = n_embd within the expert slab
+                const size_t row_size = wt.nb_expert / n_rows; // full row (n_ff elements)
+                const size_t row_half = nb_half / n_rows;       // half row (n_ff/2 elements)
+                const uint8_t * sh0 = (const uint8_t *) wt.shards[0]->data + (size_t) w.expert*nb_half;
+                const uint8_t * sh1 = (const uint8_t *) wt.shards[1]->data + (size_t) w.expert*nb_half;
+                for (int64_t r = 0; r < n_rows; r++) {
+                    const size_t dst = (size_t) w.slot*wt.nb_expert + (size_t) r*row_size;
+                    ggml_backend_tensor_set(wt.cache, sh0 + (size_t) r*row_half, dst,          row_half);
+                    ggml_backend_tensor_set(wt.cache, sh1 + (size_t) r*row_half, dst+row_half, row_half);
+                }
             } else {
                 const uint8_t * src = (const uint8_t *) wt.host->data + (size_t) w.expert*wt.nb_expert;
                 ggml_backend_tensor_set(wt.cache, src, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
