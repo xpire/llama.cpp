@@ -1753,7 +1753,9 @@ static void ggml_compute_forward_mul_mat_id(
                 src0_cur, matrix_rows, row_size, src1_cont, wdata
             );
 
-            if (nth >= nchunk0 * nchunk1) {
+            // fast path (one chunk per thread) is only valid when ALL pool threads work;
+            // a numa-node-tagged op runs on a thread subset, so keep fetch-adding until done
+            if (nth >= nchunk0 * nchunk1 && numa_node < 0) {
                 break;
             }
 
