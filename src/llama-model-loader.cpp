@@ -1513,28 +1513,29 @@ static void llama_numa_mbind_tensor(struct ggml_tensor * tensor); // defined bel
 // in a CPU buffer, mbind'd to its node. returns {nullptr, nullptr} when the split is not possible.
 // NOTE: no data copy here — src->data is not loaded yet at create time; the caller fills the
 // shards with llama_numa_shard_copy() after the model tensors are loaded.
-llama_numa_shard_pair llama_numa_shard_tensor(const ggml_tensor * src, ggml_context * ctx) {
-    const int64_t n_ff    = src->ne[0];
-    const int64_t n_ff_s  = n_ff / 2;
-    const size_t  blck    = ggml_blck_size(src->type);
+llama_numa_shard_pair llama_numa_shard_tensor(const ggml_tensor * src, ggml_context * ctx, int axis) {
     llama_numa_shard_pair out;
-    if (n_ff % (2 * blck) != 0 || n_ff_s * 2 != n_ff) {
+    GGML_ASSERT(axis == 0 || axis == 1);
+    const int64_t n_split   = src->ne[axis];
+    const int64_t n_split_s = n_split / 2;
+    const size_t  blck      = ggml_blck_size(src->type);
+    // the split dim must stay quant-block aligned (contiguous byte rows, block-decodable)
+    if (n_split % (2 * blck) != 0 || n_split_s * 2 != n_split) {
         return out;
     }
 
-    // one allocation holding BOTH shards: each shard is nbytes/2 (half the rows of every
-    // column), so the total shard memory equals the full expert tensor (each node holds half).
-    // NOTE: the allocation is the FULL nbytes — a nbytes/2 allocation with the k * nbytes/2
-    //   offsets below would place shard 1 entirely outside the heap (75 MB overflow per expert).
+    // one allocation holding BOTH shards (each half the source): total memory = the source
     void * buf = nullptr;
     if (posix_memalign(&buf, 4096, ggml_nbytes(src)) != 0) {
         return out;
     }
     out.data = buf;
+    out.axis = axis;
     for (int k = 0; k < 2; k++) {
-        ggml_tensor * t = ggml_new_tensor_3d(ctx, src->type, n_ff_s, src->ne[1], src->ne[2]);
+        int64_t ne[3] = { src->ne[0], src->ne[1], src->ne[2] };
+        ne[axis] = n_split_s;
+        ggml_tensor * t = ggml_new_tensor_3d(ctx, src->type, ne[0], ne[1], ne[2]);
         t->numa_node = k;
-        // shard k holds the k-th half of every row
         uint8_t * drow = (uint8_t *) buf + (size_t) k * (ggml_nbytes(src) / 2);
         ggml_backend_buffer_t bbuf = ggml_backend_cpu_buffer_from_ptr(drow, ggml_nbytes(src) / 2);
         ggml_backend_tensor_alloc(bbuf, t, drow);
@@ -1544,21 +1545,35 @@ llama_numa_shard_pair llama_numa_shard_tensor(const ggml_tensor * src, ggml_cont
     return out;
 }
 
-// tensor-split NUMA (P1 inc-3): strided copy of a loaded expert tensor's per-row halves into its
-// shards (the inverse of the file layout: shard k gets the k-th half of every row).
-void llama_numa_shard_copy(const llama_numa_shard_pair & shards, const ggml_tensor * src) {
+// tensor-split NUMA (P1 inc-3): copy the loaded expert tensor's halves into its shards.
+//   axis 0 (down, input-split):  shard k = the k-th half of every row   (strided per row)
+//   axis 1 (gate/up, output-split): shard k = the k-th half of each expert's rows (contiguous)
+void llama_numa_shard_copy(const llama_numa_shard_pair & shards, const ggml_tensor * src, int axis) {
     GGML_ASSERT(src != nullptr && src->data != nullptr);
-    const int64_t n_ff    = src->ne[0];
-    const int64_t n_ff_s  = n_ff / 2;
-    const size_t row_size   = ggml_row_size(src->type, n_ff);
-    const size_t row_size_s = ggml_row_size(src->type, n_ff_s);
-    const int64_t n_rows    = src->ne[1] * src->ne[2];
+    const size_t total = ggml_nbytes(src);
     for (int k = 0; k < 2; k++) {
         GGML_ASSERT(shards.shards[k] != nullptr && shards.shards[k]->data != nullptr);
-        const uint8_t * srow = (const uint8_t *) src->data + (size_t) k * row_size_s;
-        uint8_t * drow = (uint8_t *) shards.shards[k]->data;
-        for (int64_t r = 0; r < n_rows; r++) {
-            memcpy(drow + r * row_size_s, srow + r * row_size, row_size_s);
+        const uint8_t * sbase = (const uint8_t *) src->data;
+        uint8_t * dbase = (uint8_t *) shards.shards[k]->data;
+        if (axis == 1) {
+            // output-split: split ne[1] (rows). each expert's rows are contiguous in memory, so
+            //   each shard is a contiguous half of every expert's block (one memcpy per expert)
+            const size_t nb_expert = total / src->ne[2];
+            const size_t nb_half   = nb_expert / 2;
+            for (int64_t e = 0; e < src->ne[2]; e++) {
+                memcpy(dbase + (size_t) e * nb_half,
+                       sbase + (size_t) e * nb_expert + (size_t) k * nb_half, nb_half);
+            }
+        } else {
+            // input-split: split ne[0]. the k-th half of every row is a contiguous byte run
+            //   (block-aligned); rows are strided across ne[1] x ne[2]
+            const size_t row_size   = ggml_row_size(src->type, src->ne[0]);
+            const size_t row_size_s = ggml_row_size(src->type, src->ne[0] / 2);
+            const int64_t n_rows    = src->ne[1] * src->ne[2];
+            const uint8_t * srow = sbase + (size_t) k * row_size_s;
+            for (int64_t r = 0; r < n_rows; r++) {
+                memcpy(dbase + (size_t) r * row_size_s, srow + (size_t) r * row_size, row_size_s);
+            }
         }
     }
 }

@@ -1442,6 +1442,11 @@ static bool llama_moe_stream_is_exps(llm_tensor tensor) {
 
 // window-mode attention streaming also routes the attention projections (attn_q/k/v/o, fused qkv);
 // they have no expert dim and are consumed by plain MUL_MAT via build_lora_mm
+// the down projection is an input-split (n_ff on ne[0]); gate/up are output-splits (n_ff on ne[1])
+static bool llama_moe_stream_is_down_exps(llm_tensor tensor) {
+    return tensor == LLM_TENSOR_FFN_DOWN_EXPS;
+}
+
 static bool llama_moe_stream_is_attn(llm_tensor tensor) {
     switch (tensor) {
         case LLM_TENSOR_ATTN_Q:
@@ -2004,7 +2009,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         } else {
             for (auto & [host, shards] : pimpl->tp_shards) {
-                llama_numa_shard_copy(shards, host);
+                llama_numa_shard_copy(shards, host, shards.axis);
             }
             for (auto & buf : pimpl->tp_host_bufs) {
                 ggml_backend_buffer_free(buf);
@@ -2104,7 +2109,8 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
                 } else {
                     pimpl->tp_split_partial = true;
                 }
-                llama_numa_shard_pair shards = llama_numa_shard_tensor(host, pimpl->tp_shard_ctx.get());
+                const int split_axis = llama_moe_stream_is_down_exps(tn.tensor) ? 0 : 1;
+                llama_numa_shard_pair shards = llama_numa_shard_tensor(host, pimpl->tp_shard_ctx.get(), split_axis);
                 if (shards.shards[0] && shards.shards[1]) {
                     pimpl->tp_shards[host] = shards;
                 } else {

@@ -24,13 +24,13 @@ using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 struct llama_numa_shard_pair {
     ggml_tensor * shards[2] = {nullptr, nullptr};
     void * data             = nullptr;
+    int   axis              = -1; // split axis: 0 = ne[0] (down/input), 1 = ne[1] (gate/up/output)
 };
 // create the two shard tensors + their buffers (no data copy: src->data is not loaded yet at
 // create time — llama_numa_shard_copy() fills them after the model tensors are loaded).
-llama_numa_shard_pair llama_numa_shard_tensor(const ggml_tensor * src, ggml_context * ctx);
-// strided copy of a loaded expert tensor's per-row halves into its shards (src->data must be
-// populated).
-void llama_numa_shard_copy(const llama_numa_shard_pair & shards, const ggml_tensor * src);
+llama_numa_shard_pair llama_numa_shard_tensor(const ggml_tensor * src, ggml_context * ctx, int axis);
+// copy of a loaded expert tensor's halves into its shards along `axis` (src->data must be loaded).
+void llama_numa_shard_copy(const llama_numa_shard_pair & shards, const ggml_tensor * src, int axis);
 
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
