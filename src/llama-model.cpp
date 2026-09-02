@@ -1997,7 +1997,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     //   all-or-nothing: if any expert failed to shard, drop the shards entirely and keep the full
     //   host tensors (the graph must never see a freed host). when fully engaged, copy the loaded
     //   host data into the shards and release the host buffers — resident expert memory is then
-    //   the shards only (~1x model size instead of 2x).
+    //   the shards only (~1x model size instead of 2x). under the file-direct path (create_tensor)
+    //   the host is a mmap alias — never materialized, so nothing is released here and tp_host_bufs
+    //   is empty; the copy reads the GGUF mapping itself. the no-mmap / pinned-buft fallback still
+    //   materializes + releases per tensor.
     if (!pimpl->tp_shards.empty()) {
         if (ml.no_alloc || pimpl->tp_split_partial) {
             for (auto & [k, v] : pimpl->tp_shards) {
@@ -2051,11 +2054,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             pimpl->tp_host_bufs.clear();
             for (auto & [host, shards] : pimpl->tp_shards) {
-                // the host tensor object stays alive as the registry key; only its (freed) data
-                // pointer is dangled. the graph's shard path never reads it.
+                // the host tensor object stays alive as the registry key. its data is freed under
+                //   the materialize fallback / aliases the live mapping under file-direct — either
+                //   way the graph's shard path never reads it, and the detach makes any stray use
+                //   fail loudly instead of silently computing on the unsplit host.
                 const_cast<ggml_tensor *>(host)->buffer = nullptr;
             }
-            LLAMA_LOG_INFO("%s: NUMA tensor split engaged — expert host tensors released, %zu shard pairs resident\n", __func__, pimpl->tp_shards.size());
+            LLAMA_LOG_INFO("%s: NUMA tensor split engaged — expert weights resident as shards (%zu pairs), host copy released/aliased\n", __func__, pimpl->tp_shards.size());
         }
     }
 
@@ -2135,21 +2140,35 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
             //   decode swaps these host tensors into the graph, which runs both shard GEMMs
             //   (each on its node's threads via numa_node) and combines. gated to multi-node.
             //   the shard DATA is copied post-load (llama_numa_shard_copy in load_tensors) —
-            //   src->data is not loaded yet at create time. the host is re-homed into its own
-            //   buffer so it can be released once the shards exist (otherwise it shares the CPU
-            //   buffer with the rest of the model and cannot be freed independently).
+            //   src->data is not loaded yet at create time.
+            // file-direct shard source: when the host's selected buft is the plain CPU default and
+            //   mmap is on (the CPU-only default), the host is NOT materialized — it stays in its
+            //   buft ctx, whose buffer wraps the GGUF mapping, so load_all_data aliases host->data
+            //   to the file and the finalize copy reads the shard bytes straight from the mapping.
+            //   no anon host copy exists, so the 2x load transient (host + shards — fatal above
+            //   ~96 GB on the P720) is gone: peak anon = the shards only. on other paths (pinned
+            //   CUDA_Host buft on GPU builds, or no mmap) the host must be materialized + re-homed
+            //   into its own buffer so it can be released once the shards exist (the old behavior).
             if (tp_split) {
                 if (!pimpl->tp_shard_ctx) {
                     ggml_init_params ip = { /*.mem_size=*/ ggml_tensor_overhead() * (2 * hparams.n_layer() * 4 + 16), /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
                     pimpl->tp_shard_ctx.reset(ggml_init(ip));
                 }
-                ggml_backend_buffer_t host_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(host));
-                if (host_buf != nullptr) {
-                    // pre-allocating the host skips it in the shared-ctx buffer allocator below
-                    ggml_backend_tensor_alloc(host_buf, host, ggml_backend_buffer_get_base(host_buf));
-                    pimpl->tp_host_bufs.push_back(host_buf);
-                } else {
-                    pimpl->tp_split_partial = true;
+                // replicate ml.create_tensor's own selection (layer-repeating MUL_MAT_ID expert,
+                //   no overrides) so this cannot diverge from the buft the host actually gets
+                const bool host_is_mmap_alias =
+                    ml.use_mmap &&
+                    select_weight_buft(hparams, w->tensor, GGML_OP_MUL_MAT_ID, host_buft_list) ==
+                        ggml_backend_cpu_buffer_type();
+                if (!host_is_mmap_alias) {
+                    ggml_backend_buffer_t host_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(host));
+                    if (host_buf != nullptr) {
+                        // pre-allocating the host skips it in the shared-ctx buffer allocator below
+                        ggml_backend_tensor_alloc(host_buf, host, ggml_backend_buffer_get_base(host_buf));
+                        pimpl->tp_host_bufs.push_back(host_buf);
+                    } else {
+                        pimpl->tp_split_partial = true;
+                    }
                 }
                 const int split_axis = llama_moe_stream_is_down_exps(tn.tensor) ? 0 : 1;
                 llama_numa_shard_pair shards = llama_numa_shard_tensor(host, pimpl->tp_shard_ctx.get(), split_axis);

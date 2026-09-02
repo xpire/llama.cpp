@@ -14,6 +14,7 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -316,7 +317,15 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
-        if (params.moe_stream && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
+        // NUMA tensor split: expert hosts are never the moe-stream I/O workers' copy source under
+        //   the split (they assemble cache slabs from the shards), so the heap-forcing below would
+        //   only buy a fatal 2x load transient. keep mmap so the split loads file-direct (hosts
+        //   alias the GGUF mapping — see llama_model_base::create_tensor and
+        //   research/m1/file-direct-shard-loading-spec.md). the gate mirrors create_tensor's
+        //   (env + ggml_numa_nodes() > 1, i.e. --numa distribute must have initialized NUMA).
+        const bool numa_split_active =
+            params.moe_stream && getenv("LLAMA_NUMA_TENSOR_SPLIT") != nullptr && ggml_numa_nodes() > 1;
+        if (params.moe_stream && params.load_mode == LLAMA_LOAD_MODE_AUTO && !numa_split_active) {
             // MoE expert streaming copies expert slabs from the materialized host tensors; mmap-backed
             // (page-cache) host tensors measure ~40% slower as the copy source (561 vs 788 t/s at ub 512),
             // so streamed models load the weights into heap. -lm none also works; this makes it default.
