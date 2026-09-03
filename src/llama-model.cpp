@@ -2094,8 +2094,14 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     // route MoE routed-expert weights (and, in layer-window mode, the attention projections) to the
     // streaming cache instead of materializing them on device: prefill reads them from the rolling
     // pool, decode from the CPU host tensors. norms/embeddings/router stay resident.
+    // m2 split-decode spec: LLAMA_MOE_STREAM_ATTN_RESIDENT=1 keeps attention projections out of the
+    // streaming pool — they load to the normal (GPU) layer buft like -ncmoe does, so decode computes
+    // them on-device from resident weights instead of the CPU host copy (A3B decode 29.7 -> ~52 t/s
+    // measured). prefill then reads the resident tensor directly (no wait-op); experts still stream.
+    // big-model default (attention streamed) is unchanged when the env var is absent.
     const bool is_exps = llama_moe_stream_is_exps(tn.tensor);
-    const bool is_attn = params.moe_stream_window > 0 && llama_moe_stream_is_attn(tn.tensor);
+    const bool attn_stream = params.moe_stream_window > 0 && getenv("LLAMA_MOE_STREAM_ATTN_RESIDENT") == nullptr;
+    const bool is_attn = attn_stream && llama_moe_stream_is_attn(tn.tensor);
     if (pimpl->moe_stream && tn.bid >= 0 && tn.bid < (int32_t) hparams.n_layer() && buft_list_layer != nullptr &&
         (flags & (TENSOR_DUPLICATED | TENSOR_SKIP | TENSOR_SKIP_IF_VIRTUAL)) == 0 &&
         (is_exps || is_attn) && tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0) {

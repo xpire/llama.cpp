@@ -283,8 +283,12 @@ llama_context::llama_context(
         // op offload snapshots host weights to the device per graph split, which assumes they do
         // not change during the graph - streamed caches are rewritten between waves, and the decode
         // phase deliberately computes experts from CPU-resident host tensors (per-token snapshots
-        // to the GPU would defeat that), so op offload is incompatible with MoE expert streaming
-        if (cparams.op_offload) {
+        // to the GPU would defeat that), so op offload is incompatible with MoE expert streaming.
+        // exception: LLAMA_MOE_STREAM_OP_OFFLOAD=1 keeps op offload on (m2 split-decode spec) so
+        // decode-side attention projections (static host tensors) run on the GPU like -ncmoe does;
+        // the expert host tensors stay CPU-computed either way (their ops never per-token offload).
+        static const bool keep_op_offload = getenv("LLAMA_MOE_STREAM_OP_OFFLOAD") != nullptr;
+        if (cparams.op_offload && !keep_op_offload) {
             LLAMA_LOG_WARN("%s: disabling op offload with MoE expert streaming\n", __func__);
             cparams.op_offload = false;
         }
